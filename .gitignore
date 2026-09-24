@@ -1,15 +1,62 @@
 # Python
+.aidebug/
 __pycache__/
 *.py[cod]
 *.pyo
+*.pytest-temp/
+*.pytest_cache/
+
+# Build output
+build/
+dist/
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+
+# Local editor settings
+.vscode/
 
 # Virtual environment
 .venv/
+.test-venv/
+*.egg-info/
 venv/
 env/
 
-# Environment variables
+# Environment variables and local secrets
 .env
+.env.*
+!.env.example
+*.secret
+*.secrets
+secrets/
+secret/
+credentials/
+credentials.*
+!src/aidebug/credentials.py
+secrets.*
+
+# API keys, tokens, certificates, and private keys
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.token
+*.tokens
+*.credentials
+*.auth
+
+# Local tool credentials
+.aws/
+.azure/
+.config/gcloud/
+.npmrc
+.pypirc
 
 # OS
 .DS_Store
