@@ -35,13 +35,37 @@ aidebug path\inside\the\project --timeout 300
 
 ### Proactive hunting
 
-Run `aidebug hunt [path]` to inspect source even when existing checks pass. `--model`, `--timeout`, and `--json` are supported. Existing checks run in a temporary source copy; the Hunter uses the read-only code tools to propose structured hypotheses. CLI output separates those existing-check results from proactive findings.
+`aidebug hunt [path]` runs the full pipeline by default. `aidebug hunt --quick [path]` is the faster, narrower alternative; there is no need to run both. Both support `--model`, `--timeout`, and `--json`.
 
-An independent verifier assigns `confirmed`, `high_confidence`, `unconfirmed`, or `rejected`. The first verification strategy checks declared numeric Python doctest examples for simple undecorated functions, using a bounded AST evaluator rather than executing source or model-generated reproduction code. It supports scalar arithmetic, comparisons, assignments, and conditionals; unsupported languages, functions, or reproduction strategies remain unconfirmed/high-confidence and are not automatically repaired. A matching example rejects that reproduction, not every possible bug in the function.
+| Strategy | Quick | Full (default) |
+| --- | --- | --- |
+| Existing checks in an isolated source copy | Yes | Yes |
+| Lightweight Python static patterns | Yes | Yes |
+| Read-only LLM source review | 12 source excerpts / 16 KB | 80 excerpts / 80 KB, plus read tools |
+| Declared numeric doctest verification | Yes | Yes |
+| Coverage-gap analysis | No | coverage.json or static test-reference heuristic |
+| Generated boundary cases | No | Up to 64 numeric cases per supported function |
+| Declared property/invariant checks | No | Yes |
+| Exception-path analysis | No | Bare handlers and generated arithmetic failures |
+| Cross-function consistency | No | Local call signatures and declared equivalence |
 
-Only a confirmed mismatch enters Analyzer → Fixer → isolated Validator. Validation must pass both existing checks and the declared examples, and cannot pass by changing the reproduction docstring. Successful repairs use the same cumulative `.aidebug/` patch/report artifacts as normal debugging. Repairs for separate findings are independent, not a jointly validated batch. Real source files remain unchanged. `hunt` exits 1 if existing checks fail or confirmed findings exist (including findings with saved repairs), 0 otherwise, and 2 for command errors. Existing-test failures are reported separately; use normal `aidebug` to repair them.
+All hypotheses pass through independent verification. Only `confirmed` findings enter Analyzer ? Fixer ? isolated Validator. `high_confidence`, `unconfirmed`, and `rejected` remain in the report without automatic repair. Static patterns such as mutable defaults, broad handlers, and call-arity mismatches are report-only suspicions; coverage gaps never prove a bug. Findings have stable IDs, source file/symbol, category, hypothesis/evidence, confidence, reproduction strategy, and verification status/evidence.
 
-`DetectionStrategy` and `VerificationStrategy` define extension points for future static analysis, generated tests, property testing, coverage, and runtime evidence. These additional strategies are not implemented yet. No findings does not mean the project is bug-free.
+Verification uses a restricted AST interpreter on isolated source, not arbitrary model-generated scripts or imported project modules. It supports simple undecorated Python functions with scalar arithmetic, comparisons, assignments, and conditionals. Generated inputs include small integers and nearby numeric boundaries in source. Numeric doctests provide expected results. Additional explicit docstring contracts are supported:
+
+```python
+def magnitude(x):
+    """aidebug invariant: result >= 0"""
+    ...
+```
+
+`aidebug total` declares that a function should not raise on the generated numeric inputs. `aidebug equivalent: other_function` declares equal results for the same inputs, with the reference function in the same file. These declarations must come from project source; the LLM cannot invent verification oracles. Unsupported code remains unconfirmed, and arithmetic exceptions without a declared input/behavior contract are high-confidence suspicions rather than confirmed bugs. Existing declarations and function signatures are pinned during repair validation, which reruns existing checks plus the reproduction and bounded generated cases.
+
+Static scans are bounded to 300 entries / 1 MB and 50 findings per strategy. Coverage JSON may be stale; direct-test-reference analysis can miss indirect coverage. Other languages can receive LLM review but do not yet have independent executable verification strategies. Full means all implemented strategies, not exhaustive verification.
+
+Every completed hunt saves `.aidebug/hunt_findings_<timestamp>.json` and `hunt_report_<timestamp>.md`, even if no findings exist. Reports separate existing surfaced failures, proactive findings, confirmed bugs, rejected hypotheses, and repair outcomes. Confirmed repairs retain cumulative validated patch/debug-report artifacts and leave real source unchanged. A repair error is recorded without dropping its finding. Separate repairs are independently validated, not jointly applied. Existing-test failures are surfaced separately; use normal `aidebug` to repair them.
+
+`hunt` exits 1 for existing-check failures or confirmed bugs (including saved repairs), 0 otherwise, and 2 for command errors. No findings and passing checks do not establish that the project is bug-free. `DetectionStrategy` and `VerificationStrategy` remain extension points for future runtime, coverage, property, and generated-test integrations.
 
 Discovery and evidence capture are deterministic and do not require an API key or Git. When Git is available, changed files and the current diff are included as extra evidence; otherwise the debugger uses the supplied folder and continues without them.
 

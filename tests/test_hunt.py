@@ -41,7 +41,9 @@ def test_healthy_project_still_runs_hunter(tmp_path, monkeypatch):
     assert result.existing_checks[0].passed
     assert not result.findings and not result.repairs
     agent.analyze.assert_not_called()
-    assert not (tmp_path / ".aidebug").exists()
+    assert result.findings_path.is_file()
+    assert result.report_path.is_file()
+    assert not list((tmp_path / ".aidebug").glob("validated_patch*"))
 
 
 def test_passing_tests_bug_is_confirmed_and_repaired(tmp_path, monkeypatch):

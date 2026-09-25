@@ -6,6 +6,7 @@ import json
 import argparse
 import math
 import operator
+import hashlib
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Literal, Protocol
@@ -26,6 +27,8 @@ class BugHypothesis:
     evidence: str
     confidence: float
     reproduction_strategy: str
+    category: str = "llm_review"
+    reproduction: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -35,12 +38,35 @@ class Finding:
     evidence: str
     check: CheckResult | None = None
 
+    @property
+    def finding_id(self) -> str:
+        data = json.dumps(asdict(self.hypothesis), sort_keys=True)
+        return "hunt_" + hashlib.sha256(data.encode()).hexdigest()[:16]
+
+    def record(self) -> dict:
+        hypothesis = self.hypothesis
+        return dict(finding_id=self.finding_id, file=hypothesis.suspected_file,
+                    symbol=hypothesis.suspected_symbol, category=hypothesis.category,
+                    hypothesis=hypothesis.description, evidence=hypothesis.evidence,
+                    confidence=hypothesis.confidence, reproduction_strategy=hypothesis.reproduction_strategy,
+                    verification_status=self.status, verification_evidence=self.evidence,
+                    status=self.status, reproduction=hypothesis.reproduction,
+                    check=asdict(self.check) if self.check else None)
+
 
 @dataclass(frozen=True)
 class HuntRun:
     existing_checks: tuple[CheckResult, ...]
     findings: tuple[Finding, ...]
     repairs: tuple[DebugRun, ...]
+    mode: str = "full"
+    strategies: tuple[str, ...] = ()
+    findings_path: Path | None = None
+    report_path: Path | None = None
+    repair_errors: tuple[str, ...] = ()
+
+    def record(self) -> dict:
+        return {**asdict(self), "findings": [finding.record() for finding in self.findings]}
 
 
 class DetectionStrategy(Protocol):
@@ -52,10 +78,22 @@ class VerificationStrategy(Protocol):
 
 
 class BugHunter:
-    def __init__(self, agent: OpenAIAgent) -> None:
+    def __init__(self, agent: OpenAIAgent, quick: bool = False) -> None:
         self.agent = agent
+        self.quick = quick
 
     def hunt(self, project: ProjectInfo) -> tuple[BugHypothesis, ...]:
+        tools = CodeTools(project.root)
+        limit = 12 if self.quick else 80
+        excerpts = []
+        budget = 16_000 if self.quick else 80_000
+        for index, path in enumerate(tools._files()):
+            if index >= limit or budget <= 0:
+                break
+            relative = path.relative_to(project.root.resolve()).as_posix()
+            excerpt = f"FILE: {relative}\n" + tools.read_file(relative, end_line=100)
+            excerpts.append(excerpt[:budget])
+            budget -= len(excerpts[-1])
         response = self.agent._complete(
             """You are the Bug Hunter. Inspect source using the read-only code tools, even if tests pass.
 Find concrete behavioral defects, not style issues. Do not propose patches.
@@ -65,7 +103,9 @@ description, evidence, confidence (0 to 1), reproduction_strategy.
 Ground evidence in inspected source and declared behavior. Inspect docstrings and
 doctest examples when present; these can be independently verified. Do not invent
 expected results or claim that a hypothesis is confirmed.""",
-            "Project files:\n" + CodeTools(project.root).list_files(), project.root,
+            ("Quick review: prioritize obvious defects.\n" if self.quick else
+             "Deep review: also examine boundaries, invariants, exceptions, test gaps, and cross-function contracts.\n")
+            + "Source excerpts (bounded; use read tools for more):\n" + "\n\n".join(excerpts), project.root,
         )
         data = _json_object(response)
         items = data.get("hypotheses")
@@ -195,6 +235,8 @@ class VerifiedRepairValidator:
         self.contract = self._contract(original)
 
     def _contract(self, project: ProjectInfo):
+        if hasattr(self.verifier, "contract"):
+            return self.verifier.contract(project, self.hypothesis)
         if not isinstance(self.verifier, DoctestVerifier):
             return None
         try:
@@ -214,7 +256,7 @@ class VerifiedRepairValidator:
 
 
 def hunt_project(project: ProjectInfo, detectors: tuple[DetectionStrategy, ...], verifier: VerificationStrategy,
-                 agent: OpenAIAgent, timeout: float = 120) -> HuntRun:
+                 agent: OpenAIAgent, timeout: float = 120, quick: bool = False) -> HuntRun:
     findings = []
     # Even existing checks run on a copy in hunt mode.
     with isolated_workspace(project.root) as workspace:
@@ -222,14 +264,23 @@ def hunt_project(project: ProjectInfo, detectors: tuple[DetectionStrategy, ...],
         results = run_checks(isolated, timeout, stop_on_failure=False)
         for detector in detectors:
             for hypothesis in detector.hunt(isolated):
-                findings.append(verifier.verify(isolated, hypothesis))
+                finding = verifier.verify(isolated, hypothesis)
+                if not any(previous.finding_id == finding.finding_id for previous in findings):
+                    findings.append(finding)
     repairs = []
+    errors = []
     for finding in findings:
         if finding.status != "confirmed" or finding.check is None or finding.check.passed:
             continue
         validator = VerifiedRepairValidator(verifier, finding.hypothesis, timeout, project)
-        repairs.append(DebugOrchestrator(agent, agent, validator).run(project, finding.check))
-    return HuntRun(results, tuple(findings), tuple(repairs))
+        try:
+            repairs.append(DebugOrchestrator(agent, agent, validator).run(project, finding.check))
+        except Exception as exc:
+            errors.append(f"{finding.finding_id}: repair failed ({type(exc).__name__}); no validated repair recorded")
+    from .hunt_reports import save_hunt_report
+    run = HuntRun(results, tuple(findings), tuple(repairs), "quick" if quick else "full",
+                  ("existing_checks", *(type(detector).__name__ for detector in detectors)), repair_errors=tuple(errors))
+    return save_hunt_report(project.root, run)
 
 
 def hunt_main(argv: list[str]) -> int:
@@ -242,6 +293,7 @@ def hunt_main(argv: list[str]) -> int:
     parser.add_argument("--model")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument("--quick", action="store_true", help="Use fewer source excerpts, lightweight static analysis, and basic verification only")
     args = parser.parse_args(argv)
     api_key = ""
     try:
@@ -250,11 +302,12 @@ def hunt_main(argv: list[str]) -> int:
         if not api_key:
             parser.error("Hunting requires an API key. Run aidebug configure or set OPENAI_API_KEY.")
         agent = OpenAIAgent(model=args.model)
-        run = hunt_project(project, (BugHunter(agent),), DoctestVerifier(), agent, args.timeout)
+        from .hunt_strategies import build_detectors, HuntVerifier
+        run = hunt_project(project, build_detectors(agent, args.quick), HuntVerifier(args.quick), agent, args.timeout, quick=args.quick)
     except Exception as exc:
         parser.error(_safe_agent_error(exc, api_key))
     if args.as_json:
-        print(json.dumps(asdict(run), default=str, indent=2))
+        print(json.dumps(run.record(), default=str, indent=2))
     else:
         print("Existing checks (isolated workspace):")
         for result in run.existing_checks:
@@ -265,11 +318,17 @@ def hunt_main(argv: list[str]) -> int:
         for finding in run.findings:
             print(f"[{finding.status}] {finding.hypothesis.suspected_file}: {finding.hypothesis.suspected_symbol}: {finding.hypothesis.description}")
             print(finding.evidence)
+        print(f"\nConfirmed bugs: {sum(f.status == 'confirmed' for f in run.findings)}")
+        print(f"Rejected hypotheses: {sum(f.status == 'rejected' for f in run.findings)}")
         for repair in run.repairs:
             passed = repair.validation is not None and repair.validation.passed
             print(f"\nProactive repair: {'validated' if passed else 'not validated'} after {repair.attempts} attempt(s).")
             if repair.validated_patch_path:
                 print(f"Validated patch saved to:\n{repair.validated_patch_path}")
                 print(f"Debug report saved to:\n{repair.debug_report_path}")
-        print("Verification coverage: supported scalar Python doctests only; other hypotheses are not automatically repaired.")
+        for error in run.repair_errors:
+            print(error)
+        print(f"Hunt mode: {run.mode}. Evidence is bounded; unsupported behavior remains unconfirmed.")
+        if run.findings_path:
+            print(f"Hunt findings saved to:\n{run.findings_path}\nHunt report saved to:\n{run.report_path}")
     return int(any(not result.passed for result in run.existing_checks) or any(finding.status == "confirmed" for finding in run.findings))
