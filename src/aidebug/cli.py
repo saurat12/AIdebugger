@@ -16,6 +16,7 @@ from .discovery import discover_repository
 from .git_integration import collect_evidence
 from .openai_agent import OpenAIAgent
 from .runner import run_checks
+from .validation import capture, summary
 
 
 def _safe_agent_error(exc: Exception, api_key: str) -> str:
@@ -67,11 +68,11 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    results = run_checks(project, args.timeout, stop_on_failure=not args.all)
+    results = capture(run_checks(project, args.timeout, stop_on_failure=not args.all))
     failed = next((result for result in results if not result.passed), None)
     changed_files, git_diff = collect_evidence(project.root)
     debug_run = None
-    if failed and not args.no_ai:
+    if failed and not failed.blocked_reason and not args.no_ai:
         try:
             api_key = resolve_api_key()
         except CredentialError as exc:
@@ -100,8 +101,12 @@ def main() -> int:
         print(f"Detected: {', '.join(project.project_types)}")
         print("\nInitial check:")
         for result in results:
-            status = "PASS" if result.passed else "FAIL"
+            status = result.status
             print(f"[{status}] {result.name}: {' '.join(result.command)}")
+            if result.blocked_reason:
+                print(f"Project-wide validation: BLOCKED\nReason: {result.blocked_reason}")
+        if not results:
+            print("Project-wide validation: NOT AVAILABLE")
         if failed:
             if debug_run:
                 print(f"\nAI analysis:\nRoot cause: {debug_run.analysis.root_cause}")
@@ -111,6 +116,8 @@ def main() -> int:
                     passed = debug_run.validation and debug_run.validation.passed
                     print("\nValidated repair:" if passed else "\nIsolated validation:")
                     if debug_run.validation:
+                        if getattr(debug_run.validation, "targeted", None):
+                            print(summary(debug_run.validation))
                         for result in debug_run.validation.results:
                             status = "PASS" if result.passed else "FAIL"
                             print(f"[{status}] {result.name} in isolated workspace")
@@ -121,7 +128,10 @@ def main() -> int:
                     print(debug_run.proposals[-1].explanation)
                 if getattr(debug_run, "validated_patch_path", None):
                     print(f"Validated patch saved to:\n{debug_run.validated_patch_path}")
+                if getattr(debug_run, "debug_report_path", None):
                     print(f"Debug report saved to:\n{debug_run.debug_report_path}")
+                if getattr(debug_run, "artifact_error", None):
+                    print(debug_run.artifact_error)
             else:
                 print("\nFailure captured. Agent prompt:\n")
                 print(build_agent_prompt(build_debug_context(project, failed, changed_files, git_diff)))

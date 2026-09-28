@@ -16,7 +16,8 @@ SOURCE = 'def double(x):\n    """>>> double(3)\n    6\n    """\n    return x + 2
 def hypothesis(**changes):
     fields = dict(suspected_file="app.py", suspected_symbol="double", description="Incorrect doubling",
                   evidence="The implementation disagrees with the declared example", confidence=0.9,
-                  reproduction_strategy="Check double(3) against its declared result 6")
+                  reproduction_strategy="Check double(3) against its declared result 6",
+                  verification_spec={"kind": "equals", "args": [3], "expected": 6})
     return BugHypothesis(**(fields | changes))
 
 
@@ -56,7 +57,7 @@ def test_passing_tests_bug_is_confirmed_and_repaired(tmp_path, monkeypatch):
     result = hunt_project(project, (detector,), DoctestVerifier(), agent)
     assert result.existing_checks[0].passed
     assert result.findings[0].status == "confirmed"
-    assert "expected 6; observed 5" in result.findings[0].evidence
+    assert '"result": 5' in result.findings[0].evidence
     assert result.repairs[0].validation.passed
     assert len(result.repairs[0].validation.results) == 2
     assert result.repairs[0].validated_patch_path.is_file()
@@ -96,7 +97,7 @@ def test_existing_tests_alone_cannot_validate_hunted_repair(tmp_path, monkeypatc
 def test_unsupported_reproduction_is_not_confirmation(tmp_path, monkeypatch, confidence, status):
     project = setup_project(tmp_path, monkeypatch, "def double(x):\n    return x + 2\n")
     agent = Mock()
-    result = hunt_project(project, (SimpleNamespace(hunt=lambda project: (hypothesis(confidence=confidence),)),), DoctestVerifier(), agent)
+    result = hunt_project(project, (SimpleNamespace(hunt=lambda project: (hypothesis(confidence=confidence, verification_spec=None),)),), DoctestVerifier(), agent)
     assert result.findings[0].status == status
     assert not result.repairs
     agent.analyze.assert_not_called()
@@ -104,7 +105,7 @@ def test_unsupported_reproduction_is_not_confirmation(tmp_path, monkeypatch, con
 
 def test_verifier_never_executes_source(tmp_path):
     (tmp_path / "app.py").write_text("raise RuntimeError('must not execute')\n" + SOURCE.replace("return x + 2", "return __import__('os').remove('app.py')"))
-    result = DoctestVerifier().verify(ProjectInfo(tmp_path, ("python",)), hypothesis())
+    result = DoctestVerifier().verify(ProjectInfo(tmp_path, ("python",)), hypothesis(verification_spec=None))
     assert result.status == "high_confidence"
     assert (tmp_path / "app.py").exists()
 

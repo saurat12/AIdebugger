@@ -12,6 +12,7 @@ class CheckSpec:
     name: str
     command: tuple[str, ...]
     reason: str
+    blocked_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -33,10 +34,16 @@ class CheckResult:
     stdout: str
     stderr: str
     duration_seconds: float
+    blocked_reason: str | None = None
+
+    status: str = field(init=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "status", "BLOCKED" if self.blocked_reason else "PASS" if self.passed else "FAIL")
 
     @property
     def passed(self) -> bool:
-        return self.returncode == 0
+        return self.returncode == 0 and not self.blocked_reason
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,7 @@ class DebugContext:
     failed_check: CheckResult
     relevant_files: tuple[Path, ...]
     git_diff: str | None = None
+    patch_feedback: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,22 @@ class ValidationReport:
     passed: bool
     results: tuple[CheckResult, ...]
     workspace: Path
+    targeted: CheckResult | None = None
+    project_results: tuple[CheckResult, ...] = ()
+    baseline: tuple[CheckResult, ...] = ()
+    syntax: CheckResult | None = None
+    project_status: str = "NOT AVAILABLE"
+    final_status: str = "REPAIR FAILED"
+    comparisons: tuple[str, ...] = ()
+    regressions: tuple[str, ...] = ()
+    skipped: tuple[str, ...] = ()
+    expected_behavior: str = "The original failing check must pass."
+    scope: str = "FULLY VALIDATED means the target passed and all discovered relevant project checks passed; it does not establish that the project is bug-free."
+    confirmation_verifier: str = "restricted-ast-runtime"
+    repair_verifier: str = "restricted-ast-runtime"
+    plan_reused: bool = False
+    replanned: bool = False
+    replan_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,3 +123,6 @@ class DebugRun:
     attempts: int
     validated_patch_path: Path | None = None
     debug_report_path: Path | None = None
+    patch_errors: tuple[str, ...] = ()
+    finding_id: str | None = None
+    artifact_error: str | None = None

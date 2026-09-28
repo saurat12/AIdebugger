@@ -139,8 +139,34 @@ def cases(function):
     for node in ast.walk(function):
         if isinstance(node, ast.Constant) and type(node.value) is int and abs(node.value) <= 1000:
             values.update((node.value - 1, node.value, node.value + 1))
-    choices = sorted(values)[:12]
-    return tuple(itertools.islice(itertools.product(choices, repeat=len(names)), 64))
+    scalar = sorted(values, key=lambda value: (abs(value), value))[:12]
+    domains = []
+    for parameter in names:
+        name = parameter.arg
+        used_as_collection = any(
+            (isinstance(node, ast.For) and isinstance(node.iter, ast.Name) and node.iter.id == name)
+            or (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == name)
+            or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"len", "sum", "min", "max", "all", "any", "list", "tuple", "set"}
+                and any(isinstance(arg, ast.Name) and arg.id == name for arg in node.args))
+            for node in ast.walk(function))
+        used_as_mapping = any(isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == name
+                              and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str)
+                              for node in ast.walk(function))
+        domain = list(scalar)
+        if used_as_collection:
+            domain += [[], [0], [0, 0], [1], [""]]
+        if used_as_mapping:
+            keys = {node.slice.value for node in ast.walk(function) if isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name) and node.value.id == name
+                    and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str)}
+            domain += [{}, *[{key: 0} for key in sorted(keys)]]
+        # Preserve candidate order while avoiding duplicate values.
+        unique = []
+        for candidate in domain:
+            if candidate not in unique:
+                unique.append(candidate)
+        domains.append(unique)
+    return tuple(itertools.islice(itertools.product(*domains), 64))
 
 
 def evaluate_case(function, funcs, args, kind):
@@ -177,20 +203,18 @@ class GeneratedEdgeCases:
                     continue
                 if self.kind == "equivalent" and not contract(function)["equivalent"]:
                     continue
-                # Independently discover broken declared examples even if the LLM misses them.
-                if self.kind == "edge" and ">>>" in (ast.get_docstring(function) or ""):
-                    item = hypothesis(file, name, self.category, "Declared example may contradict implementation", "Source docstring example", {"kind": "doctest"})
-                    if DoctestVerifier().verify(project, item).status == "confirmed":
-                        findings.append(item)
                 for args in cases(function):
                     try:
                         status, evidence = evaluate_case(function, funcs, args, self.kind)
                     except (ValueError, TypeError, ArithmeticError, RecursionError):
                         continue
                     if status != "rejected":
+                        trigger = json.dumps(args, sort_keys=True, ensure_ascii=True)
                         findings.append(hypothesis(file, name, self.category, "Generated case exposes a behavioral inconsistency",
                                                    evidence, {"kind": self.kind, "args": list(args)}, 0.9 if status == "confirmed" else 0.8))
-                        break
+                        findings[-1] = BugHypothesis(**{**findings[-1].__dict__, "root_cause_key": f"{file}:{name}:{trigger}"})
+                        if self.kind == "equivalent":
+                            break  # One violated equivalence is one root cause; other detectors retain distinct faults.
                 if len(findings) >= 50:
                     return tuple(findings)
         return tuple(findings)
@@ -242,7 +266,7 @@ class ExceptionPathAnalysis:
         return tuple(findings[:50])
 
 
-class HuntVerifier(DoctestVerifier):
+class LegacyVerifier(DoctestVerifier):
     def __init__(self, quick=False):
         self.quick = quick
 
@@ -254,11 +278,24 @@ class HuntVerifier(DoctestVerifier):
         except (ValueError, OSError):
             return ()
 
+    def prepare_repair(self, project, item):
+        kind = (item.reproduction or {}).get("kind")
+        # These adapters compare declared invariant/example behavior after the
+        # change; their independently failing oracle is also the repair oracle.
+        if not self.quick and kind in ("edge", "invariant", "equivalent"):
+            return item if self.contract(project, item) else None
+        return None
+
     def verify(self, project, item):
+        if item.verification_spec is not None:
+            from .verification import StructuredVerifier
+            return StructuredVerifier().verify(project, item)
         reproduction = item.reproduction or {}
         kind = reproduction.get("kind")
-        if kind in (None, "doctest"):
-            return super().verify(project, item)
+        if kind == "doctest":
+            raise UnsupportedEvidence("doctest must be selected through the registered explicit adapter")
+        if kind is None:
+            raise UnsupportedEvidence("no explicit verification adapter selected")
         if kind == "coverage_gap":
             return Finding(item, "unconfirmed", "A coverage/test-reference gap is not proof of a bug. Recorded coverage may be stale; static references may miss indirect calls.")
         try:
@@ -308,6 +345,13 @@ class HuntVerifier(DoctestVerifier):
             return Finding(item, "unconfirmed", "Independent check is unsupported or no longer reproducible; no repair authorized.")
 
 
+from .hunt_registry import RegistryVerifier
+
+
+class HuntVerifier(RegistryVerifier):
+    """Compatibility entry point backed by registered verifier capabilities."""
+
+
 def build_detectors(agent, quick=False):
-    basic = (StaticAnalysis(), BugHunter(agent, quick=quick))
-    return basic if quick else (*basic, CoverageGapAnalysis(), GeneratedEdgeCases(), PropertyChecks(), ExceptionPathAnalysis(), CrossFunctionChecks())
+    from .hunt_registry import detector_registry
+    return detector_registry().build(agent, quick)

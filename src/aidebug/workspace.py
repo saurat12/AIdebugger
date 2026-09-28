@@ -88,12 +88,13 @@ def parse_unified_diff(diff: str) -> tuple[FileDiff, ...]:
             old_start = int(match.group(1))
             old_count = int(match.group(2) or "1")
             new_count = int(match.group(4) or "1")
+            header_line = index + 1
             index += 1
             body = []
             consumed_old = consumed_new = 0
             while consumed_old < old_count or consumed_new < new_count:
                 if index >= len(lines):
-                    raise InvalidUnifiedDiffError("Patch hunk line counts do not match its header")
+                    raise InvalidUnifiedDiffError(f"Patch hunk line counts do not match its header at line {header_line}: expected old={old_count}, new={new_count}; observed old={consumed_old}, new={consumed_new} at end of patch")
                 line = lines[index]
                 prefix = line[:1]
                 if prefix == " ":
@@ -109,7 +110,7 @@ def parse_unified_diff(diff: str) -> tuple[FileDiff, ...]:
                 else:
                     raise InvalidUnifiedDiffError(f"Invalid unified diff line at line {index + 1}")
                 if consumed_old > old_count or consumed_new > new_count:
-                    raise InvalidUnifiedDiffError("Patch hunk line counts do not match its header")
+                    raise InvalidUnifiedDiffError(f"Patch hunk line counts do not match its header at line {header_line}: expected old={old_count}, new={new_count}; observed old={consumed_old}, new={consumed_new} at line {index + 1}")
                 body.append(line)
                 index += 1
             if index < len(lines) and lines[index].startswith("\\"):
@@ -129,13 +130,17 @@ def parse_unified_diff(diff: str) -> tuple[FileDiff, ...]:
 
 
 def _apply_unified_diff(root: Path, diff: str) -> None:
+    # Validate every file before writing any of them. Rejected retries must not
+    # leave a partially applied proposal in the cumulative workspace.
+    staged: dict[Path, str | None] = {}
     for file_diff in parse_unified_diff(diff):
         source_path = _safe_patch_path(root, file_diff.old_name) if file_diff.old_name != "/dev/null" else None
         target_path = _safe_patch_path(root, file_diff.new_name) if file_diff.new_name != "/dev/null" else None
-        if source_path is not None and not source_path.is_file():
+        if source_path is not None and (staged[source_path] is None if source_path in staged else not source_path.is_file()):
             raise PatchApplicabilityError("Patch source does not exist in the workspace")
         try:
-            original = source_path.read_text(encoding="utf-8").splitlines(keepends=True) if source_path else []
+            content = staged[source_path] if source_path in staged else source_path.read_text(encoding="utf-8") if source_path else ""
+            original = content.splitlines(keepends=True)
         except (OSError, UnicodeDecodeError):
             raise PatchApplicabilityError("Unable to read patch source") from None
         updated: list[str] = []
@@ -162,11 +167,17 @@ def _apply_unified_diff(root: Path, diff: str) -> None:
                 previous_prefix = line[:1]
         updated.extend(original[source_index:])
         if target_path is None:
-            if source_path and source_path.exists():
-                source_path.unlink()
+            if source_path:
+                staged[source_path] = None
         else:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text("".join(updated), encoding="utf-8")
+            staged[target_path] = "".join(updated)
+    for path, content in staged.items():
+        if content is None:
+            if path.exists():
+                path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
 
 
 def _diff_path(value: str) -> str:

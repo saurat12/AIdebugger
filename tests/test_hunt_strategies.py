@@ -7,7 +7,7 @@ import pytest
 
 from aidebug.hunt import BugHunter, BugHypothesis, hunt_main, hunt_project
 from aidebug.hunt_strategies import (CoverageGapAnalysis, CrossFunctionChecks, ExceptionPathAnalysis,
-                                     GeneratedEdgeCases, HuntVerifier, PropertyChecks, StaticAnalysis, build_detectors)
+                                     GeneratedEdgeCases, HuntVerifier, PropertyChecks, StaticAnalysis, build_detectors, cases)
 from aidebug.models import AnalysisReport, CheckResult, PatchProposal, ProjectInfo
 
 
@@ -33,8 +33,23 @@ def test_default_full_is_superset_of_quick():
     full = build_detectors(agent)
     assert [type(strategy) for strategy in quick] == [StaticAnalysis, BugHunter]
     assert [type(strategy) for strategy in full[:2]] == [type(strategy) for strategy in quick]
-    assert [type(strategy) for strategy in full[2:]] == [CoverageGapAnalysis, GeneratedEdgeCases, PropertyChecks, ExceptionPathAnalysis, CrossFunctionChecks]
+    assert [type(strategy) for strategy in full[2:7]] == [CoverageGapAnalysis, GeneratedEdgeCases, PropertyChecks, ExceptionPathAnalysis, CrossFunctionChecks]
+    assert {type(strategy).__name__ for strategy in full[7:]} == {"StateMutationAnalysis", "ResourceAnalysis", "NonterminationAnalysis", "CrossModuleAnalysis", "NativeValidationEvidence"}
     assert quick[1].quick and not full[1].quick
+
+
+def test_edge_case_domains_include_zero_and_empty_collections():
+    tree = __import__("ast").parse("def target(values):\n    return sum(values) / len(values)\n")
+    generated = cases(tree.body[0])
+    assert (0,) in generated
+    assert ([],) in generated
+
+
+def test_multiple_independent_edge_triggers_in_one_symbol_remain_distinct(tmp_path):
+    target = project(tmp_path, 'def ratio(value):\n    """aidebug total"""\n    return 1 / (value * (value - 1))\n')
+    findings = GeneratedEdgeCases().hunt(target)
+    observed = {finding.reproduction["args"][0] for finding in findings}
+    assert {0, 1} <= observed
 
 
 @pytest.mark.parametrize("quick", [False, True])
@@ -68,6 +83,8 @@ def test_full_generated_invariant_confirms_hidden_bug_and_repairs(tmp_path, monk
     confirmed = [finding for finding in result.findings if finding.status == "confirmed"]
     assert confirmed and confirmed[0].hypothesis.category == "property_invariant"
     assert result.repairs[0].validation.passed
+    assert result.repairs[0].validation.plan_reused
+    assert not result.repairs[0].validation.replanned
     assert result.repairs[0].validated_patch_path.is_file()
     record = next(item for item in json.loads(result.findings_path.read_text())["findings"] if item["verification_status"] == "confirmed")
     required = {"finding_id", "file", "symbol", "category", "hypothesis", "evidence", "confidence", "reproduction_strategy", "verification_status", "verification_evidence"}
@@ -160,7 +177,9 @@ def test_failed_repair_still_saves_confirmed_finding(tmp_path, monkeypatch):
     agent = empty_agent()
     agent.analyze.side_effect = RuntimeError("error")
     result = hunt_project(target, (SimpleNamespace(hunt=lambda project: (item,)),), verifier, agent)
-    assert result.repair_errors
+    assert not result.repair_errors
+    assert not result.repairs
+    assert result.findings[0].verification_state == "CONFIRMED_BUT_EXPECTED_BEHAVIOR_UNKNOWN"
     assert result.findings_path.is_file()
     assert "confirmed" in result.report_path.read_text()
     assert not list((tmp_path / ".aidebug").glob("validated_patch*"))
@@ -176,5 +195,5 @@ def test_cli_default_and_quick_selection(tmp_path, monkeypatch, capsys, quick):
     monkeypatch.setattr("aidebug.hunt.hunt_project", run)
     assert hunt_main([str(tmp_path), "--json", *(["--quick"] if quick else [])]) == 0
     assert run.call_args.kwargs["quick"] == quick
-    assert len(run.call_args.args[1]) == (2 if quick else 7)
+    assert len(run.call_args.args[1]) == (2 if quick else 12)
     assert json.loads(capsys.readouterr().out)["mode"] == ("quick" if quick else "full")

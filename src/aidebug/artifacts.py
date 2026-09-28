@@ -54,12 +54,19 @@ def save_validated_repair(run: DebugRun, workspace: Path, originals: dict[str, b
     patch_path = folder / f"validated_patch_{stamp}.diff"
     report_path = folder / f"debug_report_{stamp}.md"
     report = render_repair_report(run, patch, changed)
-    with patch_path.open("x", encoding="utf-8", newline="") as handle:
-        handle.write(patch)
+    created = []
     try:
+        with patch_path.open("x", encoding="utf-8", newline="") as handle:
+            created.append(patch_path)
+            handle.write(patch)
         with report_path.open("x", encoding="utf-8", newline="") as handle:
+            created.append(report_path)
             handle.write(report)
     except OSError:
-        patch_path.unlink()
+        for path in created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         raise
     return patch_path, report_path

@@ -99,6 +99,8 @@ def build_agent_prompt(context: DebugContext) -> str:
             "Version-control diff:",
             "(Git evidence unavailable)" if context.git_diff is None else context.git_diff or "(working tree clean)",
             "Return: root cause, proposed patch, and a validation command.",
+            "Patch validation feedback (re-read the current workspace before retrying):",
+            "\n".join(context.patch_feedback) or "No rejected patches.",
         )
     )
 

@@ -70,6 +70,9 @@ must be a non-empty plain unified diff and explanation must describe the repair.
 Use status="no_patch" only when no safe concrete repair can be proposed;
 unified_diff must be null and explanation must state why no safe patch could be produced.
 Never return an empty unified_diff string.
+Missing validation tools are environment blockers, not source bugs. Never add or edit
+dependency/configuration files merely to satisfy AIdebugger's validation environment.
+Never propose package installation commands as source repairs.
 The project may contain changes from earlier repair attempts.
 Inspect the current project state before proposing the next patch.
 The proposed patch must apply to the current workspace state.
@@ -77,6 +80,14 @@ The unified_diff JSON string must contain only a plain unified diff, with newlin
 escaped as required by JSON. Each file change inside that string must begin directly with:
 --- <old path>
 +++ <new path>
+Follow each header pair with numeric hunks: @@ -old_start,old_count +new_start,new_count @@.
+Count every context and removed line in old_count, and every context and added line in
+new_count. Omitted counts mean exactly one line. Prefix EVERY hunk body line with
+a space (unchanged), - (removed), or + (added), including blank lines. Copy context
+and removed lines exactly from the current workspace. Never use bare @@, placeholders,
+ellipsis for omitted code, prose, or blank separator lines between hunks/files.
+For example, replacing one line uses @@ -1,1 +1,1 @@ followed by -old and +new.
+Use read_file to inspect affected files when the supplied current source is incomplete.
 Do not include diff --git, index, new file mode, deleted file mode, similarity index, or rename metadata.
 Use /dev/null for file creation and deletion. Do not include markdown fences.""",
             _evidence_prompt(context)

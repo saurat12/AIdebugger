@@ -40,8 +40,9 @@ def test_missing_environment_never_falls_back_to_pipx_or_path(tmp_path, monkeypa
     monkeypatch.setattr(sys, "executable", "C:/pipx/venvs/aidebugger/Scripts/python.exe")
     probe = Mock()
     monkeypatch.setattr(discovery.subprocess, "run", probe)
-    with pytest.raises(ValueError, match="No usable project-local Python"):
-        discovery.discover_repository(tmp_path)
+    project = discovery.discover_repository(tmp_path)
+    assert "No usable project-local Python" in project.checks[0].blocked_reason
+    assert "pipx" not in project.checks[0].command[0]
     probe.assert_not_called()
 
 

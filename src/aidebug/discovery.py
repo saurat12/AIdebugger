@@ -9,6 +9,8 @@ from pathlib import Path
 from .models import CheckSpec, ProjectInfo
 
 _PROJECT_MARKERS = (
+    "Makefile", "makefile",
+    "pom.xml", "build.gradle", "build.gradle.kts", "go.mod", "Cargo.toml",
     "pyvenv.cfg",
     "pyproject.toml",
     "package.json",
@@ -66,38 +68,9 @@ def discover_repository(start: Path | str = ".") -> ProjectInfo:
     """Detect the active project and its safe checks."""
 
     root = find_project_root(start)
-    types: list[str] = []
-    checks: list[CheckSpec] = []
-
-    if any((root / name).exists() for name in _PYTHON_MARKERS):
-        types.append("python")
-        pyproject_tools = _pyproject_tools(root / "pyproject.toml")
-        python_checks = []
-        if (root / "tests").is_dir() or "pytest" in pyproject_tools or (root / "pytest.ini").exists():
-            python_checks.append(("pytest", ("pytest",), "Python tests"))
-        if "ruff" in pyproject_tools or (root / "ruff.toml").exists():
-            python_checks.append(("ruff", ("ruff", "check", "."), "Python linting"))
-        if "mypy" in pyproject_tools or (root / "mypy.ini").exists():
-            python_checks.append(("mypy", ("mypy", "."), "Python type checking"))
-        if python_checks:
-            python_executable = _project_python(root)
-            checks.extend(CheckSpec(name, (python_executable, "-m", *args), reason) for name, args, reason in python_checks)
-
-    package_json = root / "package.json"
-    if package_json.exists():
-        types.append("node")
-        package = _read_package_json(package_json)
-        dependencies = {**package.get("dependencies", {}), **package.get("devDependencies", {})}
-        if "react" in dependencies or "react-dom" in dependencies:
-            types.append("react")
-        scripts = package.get("scripts", {})
-        for name, reason in (("test", "Node tests"), ("lint", "JavaScript linting"), ("build", "Project build")):
-            if name in scripts:
-                checks.append(CheckSpec(f"npm {name}", ("npm", "run", name), reason))
-
-    if not types:
-        types.append("unknown")
-    return ProjectInfo(root=root, project_types=tuple(types), checks=tuple(checks))
+    from .validation_discovery import discover_checks
+    types, checks = discover_checks(root)
+    return ProjectInfo(root=root, project_types=types, checks=checks)
 
 
 def _read_package_json(path: Path) -> dict:
