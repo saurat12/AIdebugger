@@ -4,7 +4,7 @@ import pytest
 
 from aidebug.hunt import BugHypothesis, VerifiedRepairValidator
 from aidebug.models import ProjectInfo
-from aidebug.verification import StructuredVerifier, VerificationPlanner, load_cached_plans, validate_spec
+from aidebug.verification import StructuredVerifier, load_cached_plans, resolve_verification_spec, validate_spec
 from aidebug.hunt_registry import RegistryVerifier
 
 
@@ -92,7 +92,8 @@ def test_plan_supports_deterministic_randomness_and_virtual_resources(tmp_path):
     assert '"resources_open": 1' in resource_finding.evidence
 
 
-def test_plan_timeout_confirmation_requires_explicit_timeout_assertion(tmp_path):
+def test_plan_timeout_confirmation_requires_explicit_timeout_assertion(tmp_path, monkeypatch):
+    monkeypatch.setattr("aidebug.verification.observe", lambda *a: {"timed_out": True, "deadline_ms": 100})
     timeout_plan = plan([{"op": "call", "target": "target", "args": [], "kwargs": {}, "as": "result"}],
                         [{"source": "timed_out", "op": "eq", "expected": True}], timeout_ms=100)
     finding = verify(tmp_path, "def target():\n    while True:\n        pass\n", timeout_plan)
@@ -132,40 +133,87 @@ def test_plan_cache_is_source_and_hypothesis_bound_and_revalidated(tmp_path):
     hypothesis = BugHypothesis("app.py", "target", "Expected 2", "evidence", .9, "call",
                                verification_plan=plan([{"op": "call", "target": "target", "args": [], "as": "v"}],
                                                       [{"source": "return", "op": "eq", "expected": 2}]))
-    first = VerificationPlanner().plan(project, hypothesis)
+    first = resolve_verification_spec(project, hypothesis)
     artifact_dir = tmp_path / ".aidebug"
     artifact_dir.mkdir()
     record = {"findings": [{"verification_status": "confirmed", "verification_plan": first}]}
     (artifact_dir / "hunt_findings_fixture.json").write_text(json.dumps(record), encoding="utf-8")
     cache = load_cached_plans(tmp_path)
-    second = VerificationPlanner().plan(project, hypothesis, cache)
+    second = resolve_verification_spec(project, hypothesis, cache)
     assert second["source"] == "validated_cache"
     assert second["plan"] == first["plan"]
 
     (tmp_path / "app.py").write_text(source.replace("return 1", "return 3"), encoding="utf-8")
-    changed = VerificationPlanner().plan(project, hypothesis, cache)
+    changed = resolve_verification_spec(project, hypothesis, cache)
     assert changed["source"] == "hunter_plan"
     assert changed["fingerprint"] != first["fingerprint"]
 
 
-def test_planner_converts_open_ended_hypothesis_to_strict_plan(tmp_path):
+def test_non_llm_resolution_handles_explicit_spec_without_planner(tmp_path):
+    (tmp_path / "app.py").write_text("def target():\n    return 1\n", encoding="utf-8")
+    spec = plan([{"op": "call", "target": "target", "args": [], "as": "value"}],
+                [{"source": "return", "op": "eq", "expected": 2}])
+    hypothesis = BugHypothesis("app.py", "target", "Expected 2", "Observed 1", .9, "example", verification_spec=spec)
+    resolved = resolve_verification_spec(ProjectInfo(tmp_path, ("python",)), hypothesis)
+    assert resolved["source"] == "structured_hypothesis"
+    assert resolved["plan"] == spec
+
+
+@pytest.mark.parametrize(("source", "line", "expected"), [
+    ("def target(:\n    pass\n", 1, "confirmed"),
+    ("def target():\n    return 1\n", 1, "rejected"),
+    ("def target():\n    return 1\n\nvalue = (\n", 1, "unconfirmed"),
+])
+def test_python_parse_capability_is_location_bound_and_never_imports(tmp_path, source, line, expected):
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+    hypothesis = BugHypothesis("app.py", "target", "Syntax failure at claimed location", "Parser diagnostic", .95,
+                               {"kind": "python_syntax"}, verification_spec={"kind": "python_syntax", "line": line})
+    finding = StructuredVerifier().verify(ProjectInfo(tmp_path, ("python",)), hypothesis)
+    assert finding.status == expected
+    assert "parser" in finding.evidence.lower()
+
+
+def test_private_project_helper_is_verifiable_but_dunder_traversal_is_blocked(tmp_path):
+    source = "def _relative_periods(value):\n    return value + 1\n"
+    spec = plan([{"op": "call", "target": "_relative_periods", "args": [1], "kwargs": {}, "as": "value"}],
+                [{"source": "return", "op": "eq", "expected": 3}])
+    finding = verify(tmp_path, source, spec, "_relative_periods")
+    assert finding.status == "confirmed"
+    invalid = plan([{"op": "call", "target": "__class__", "args": [], "kwargs": {}, "as": "value"}],
+                   [{"source": "return", "op": "eq", "expected": None}])
+    with pytest.raises(ValueError, match="dunder"):
+        validate_spec(invalid)
+
+
+def test_restricted_runtime_supports_max_with_local_mapping_get_key(tmp_path):
+    source = "def target(mapping):\n    return max(mapping, key=mapping.get)\n"
+    spec = plan([{"op": "call", "target": "target", "args": [{"a": 1, "b": 5, "c": 3}], "kwargs": {}, "as": "key"}],
+                [{"source": "return", "op": "eq", "expected": "b"}])
+    finding = verify(tmp_path, source, spec)
+    assert finding.status == "rejected", finding.evidence
+
+
+def test_module_expression_slicing_reproduces_only_selected_unresolved_name(tmp_path):
+    source = "import os\nvalue = f'{missing_local}'\n"
+    (tmp_path / "module.py").write_text(source, encoding="utf-8")
+    spec = {"kind": "module_fragment", "target_lines": [2, 2], "target_kind": "expression",
+            "expected": {"exception": None}, "timeout_ms": 500}
+    hypothesis = BugHypothesis("module.py", "", "Selected expression references an unresolved local", "Static reference evidence",
+                               .91, {"kind": "module_fragment"}, verification_spec=spec)
+    finding = StructuredVerifier().verify(ProjectInfo(tmp_path, ("python",)), hypothesis)
+    assert finding.status == "confirmed", finding.evidence
+    assert '"type": "NameError"' in finding.evidence
+
+
+def test_open_ended_hypothesis_remains_unverifiable_without_a_structured_plan(tmp_path):
     source = "def target(items):\n    return items[len(items)]\n"
     (tmp_path / "app.py").write_text(source, encoding="utf-8")
     hypothesis = BugHypothesis("app.py", "target", "A valid index is rejected at the boundary", "Index equals length",
                                .9, "Call with an input whose index equals its length", category="other")
-    generated = plan([{"op": "call", "target": "target", "args": [[1, 2]], "kwargs": {}, "as": "result"}],
-                     [{"source": "return", "op": "eq", "expected": 2}])
-
-    class PlannerAgent:
-        def _complete(self, prompt, user, cwd):
-            assert "Never return Python, shell" in prompt
-            return json.dumps({"verification_plan": generated})
-
-    planned = VerificationPlanner(PlannerAgent()).plan(ProjectInfo(tmp_path, ("python",)), hypothesis)
-    assert planned["source"] == "model_planner"
-    finding = StructuredVerifier().verify(ProjectInfo(tmp_path, ("python",)),
-                                           BugHypothesis(**{**hypothesis.__dict__, "verification_plan": planned["plan"]}))
-    assert finding.status == "confirmed"
+    assert resolve_verification_spec(ProjectInfo(tmp_path, ("python",)), hypothesis) is None
+    finding = StructuredVerifier().verify(ProjectInfo(tmp_path, ("python",)), hypothesis)
+    assert finding.verification_state == "UNVERIFIABLE"
+    assert "free-form reproduction text is never executed" in finding.evidence
 
 
 @pytest.mark.parametrize(("expression", "expected"), [
@@ -239,6 +287,6 @@ def test_pinned_plan_is_reused_and_invalidated_plan_is_blocked(tmp_path):
     path.write_text("def target():\n    match 2:\n        case 2:\n            return 2\n", encoding="utf-8")
     report = validator.validate(project)
     assert report.final_status == "TARGETED VERIFICATION BLOCKED"
-    assert report.plan_reused and not report.replanned
-    assert report.replan_reason and "could not produce" in report.replan_reason
+    assert report.plan_reused and not report.passed
+    assert "unsupported" in report.targeted.stderr.casefold()
     assert "doctest" not in report.targeted.name

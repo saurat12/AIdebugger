@@ -6,6 +6,7 @@ from dataclasses import replace
 from .models import CheckResult, ValidationReport
 from .runner import classify_availability
 from .validation_discovery import python_sources
+from .workspace import _safe_patch_path
 
 
 def capture(results):
@@ -61,12 +62,18 @@ def compare_baseline(before, after):
     return tuple(comparisons), tuple(regressions)
 
 
-def syntax_check(project):
-    if "python" not in project.project_types:
+def syntax_check(project, modified_files=None):
+    """Compile source only; an explicit repair set is never discovery-filtered."""
+    if modified_files is None and "python" not in project.project_types:
         return None
+    paths = (python_sources(project.root) if modified_files is None else
+             tuple(_safe_patch_path(project.root, name) for name in sorted(set(modified_files))
+                   if str(name).casefold().endswith(".py")))
     count = 0
     try:
-        for path in python_sources(project.root):
+        for path in paths:
+            if modified_files is not None and not path.exists():
+                continue  # Deleted Python files have no remaining source to compile.
             if path.stat().st_size > 120000:
                 return CheckResult("Python syntax", ("bounded-compile",), 1, "", "Source exceeds syntax inspection limit", 0,
                                    "Source exceeds syntax inspection limit")
@@ -74,10 +81,19 @@ def syntax_check(project):
             compile(path.read_bytes(), path.relative_to(project.root).as_posix(), "exec")
             count += 1
     except SyntaxError as exc:
-        return CheckResult("Python syntax", ("bounded-compile",), 1, "", f"{exc.filename}:{exc.lineno}: {exc.msg}", 0)
+        return CheckResult("Python syntax", ("bounded-compile",), 1, "",
+                           f"{exc.filename}:{exc.lineno}:{exc.offset}: {type(exc).__name__}: {exc.msg}", 0)
     except (OSError, ValueError) as exc:
         return CheckResult("Python syntax", ("bounded-compile",), 1, "", type(exc).__name__, 0, "Source could not be inspected")
     return CheckResult("Python syntax", ("bounded-compile",), 0, f"{count} Python files compiled without execution; bounded source scan", "", 0)
+
+
+def syntax_rejection(project, syntax, baseline=(), **metadata):
+    """A failed mandatory syntax gate authorizes no later validation or persistence."""
+    return ValidationReport(False, (syntax,), project.root, baseline=tuple(baseline), syntax=syntax,
+                            final_status="REPAIR FAILED", skipped=("Targeted verification not executed: syntax pre-validation failed",
+                                                                   "Project-wide validation not executed: syntax pre-validation failed"),
+                            **metadata)
 
 
 def evaluate(project, target, results, baseline=(), syntax=None, baseline_syntax=None, expected="Original failing check passes"):
@@ -88,8 +104,9 @@ def evaluate(project, target, results, baseline=(), syntax=None, baseline_syntax
         comparisons += syntax_comparison
         regressions += syntax_regression
     status = project_status(results)
-    accepted = target.passed and not regressions
-    final = ("REPAIR FAILED" if not target.passed else "REGRESSION DETECTED" if regressions
+    syntax_failed = syntax is not None and not syntax.passed
+    accepted = target.passed and not regressions and not syntax_failed
+    final = ("REPAIR FAILED" if not target.passed or syntax_failed else "REGRESSION DETECTED" if regressions
              else "FULLY VALIDATED" if status == "PASS"
              else "TARGET FIX VERIFIED / PROJECT VALIDATION BLOCKED" if status == "BLOCKED"
              else "TARGET FIX VERIFIED")

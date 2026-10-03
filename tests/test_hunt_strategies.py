@@ -84,7 +84,6 @@ def test_full_generated_invariant_confirms_hidden_bug_and_repairs(tmp_path, monk
     assert confirmed and confirmed[0].hypothesis.category == "property_invariant"
     assert result.repairs[0].validation.passed
     assert result.repairs[0].validation.plan_reused
-    assert not result.repairs[0].validation.replanned
     assert result.repairs[0].validated_patch_path.is_file()
     record = next(item for item in json.loads(result.findings_path.read_text())["findings"] if item["verification_status"] == "confirmed")
     required = {"finding_id", "file", "symbol", "category", "hypothesis", "evidence", "confidence", "reproduction_strategy", "verification_status", "verification_evidence"}

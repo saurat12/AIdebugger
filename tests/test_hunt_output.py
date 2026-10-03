@@ -7,8 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from aidebug.hunt import BugHypothesis, Finding, HuntRun, hunt_main, hunt_project, render_repair_output
-from aidebug.models import AnalysisReport, PatchProposal, ProjectInfo
+from aidebug.hunt import BugHypothesis, Finding, HuntRun, hunt_main, hunt_project, render_hunt_summary, render_repair_output
+from aidebug.models import AnalysisReport, CheckResult, PatchProposal, ProjectInfo
 from aidebug.hunt_strategies import HuntVerifier
 
 
@@ -30,26 +30,32 @@ def repaired_findings(tmp_path, monkeypatch):
 
 def test_one_block_per_finding_and_complete_matching_artifacts(tmp_path, monkeypatch, capsys):
     run = repaired_findings(tmp_path, monkeypatch)
+    report_before = run.report_path.read_text(encoding="utf-8")
+    findings_before = run.findings_path.read_text(encoding="utf-8")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("aidebug.discovery.discover_repository", lambda p: ProjectInfo(tmp_path, ("python",)))
     monkeypatch.setattr("aidebug.hunt.hunt_project", lambda *a, **k: run)
     hunt_main([str(tmp_path)])
     output = capsys.readouterr().out
-    for label in ("Targeted Verification:", "Syntax Check:", "Project-wide validation:", "Final Repair Status:"):
-        assert output.count(label) == 2
-    assert output.count("Confirmed bugs:") == 1
-    assert output.endswith("Confirmed bugs: 2\nRepairs verified: 2\nRepairs failed: 0\nRepairs blocked: 0\n")
+    assert output.startswith("AIdebug Hunt\n\nBaseline: NOT AVAILABLE")
+    assert "Bugs found: 2" in output and "Confirmed: 2" in output
+    assert "Repairs verified: 2" in output
+    assert output.count("AIdebug Hunt") == 1
+    assert output.rstrip().endswith("Report:\n" + str(run.report_path.resolve()))
+    assert str(run.findings_path.resolve()) not in output
+    for private_detail in ("Verification evidence", "confidence", "reproduction", "Detector signals",
+                           "Normalized verification plan", "Repair Authorization", "Strategy Coverage"):
+        assert private_detail not in output
+    assert run.report_path.read_text(encoding="utf-8") == report_before
+    assert run.findings_path.read_text(encoding="utf-8") == findings_before
     stamps = []
-    for index, finding in enumerate(run.findings):
+    for finding in run.findings:
         identifier = finding.finding_id
-        assert output.count(identifier + ": repair result") == 1
-        block = output.split(identifier + ": repair result", 1)[1].split(": repair result", 1)[0]
-        repair = run.repairs[index]
-        assert "File: " + finding.hypothesis.suspected_file in block
-        assert "Symbol: double" in block
-        for label, path in (("Validated patch", repair.validated_patch_path), ("Debug report", repair.debug_report_path)):
-            assert label + " saved to:\n" + str(path.resolve()) in block
+        assert identifier not in output
+        repair = next(repair for repair in run.repairs if repair.finding_id == identifier)
+        for path in (repair.validated_patch_path, repair.debug_report_path):
             assert path.is_file()
+            assert str(path.resolve()) not in output
         stamp = repair.validated_patch_path.stem.removeprefix("validated_patch_")
         assert repair.debug_report_path.stem == "debug_report_" + stamp
         assert identifier in repair.debug_report_path.read_text(encoding="utf-8")
@@ -125,8 +131,71 @@ def test_hunt_report_save_failure_preserves_repair_paths(tmp_path, monkeypatch, 
     monkeypatch.setattr("aidebug.hunt.hunt_project", lambda *a, **k: run)
     hunt_main([str(tmp_path)])
     output = capsys.readouterr().out
-    assert "Artifact-save error (PermissionError): could not persist hunt findings/report" in output
-    assert "Hunt report saved to:" not in output
-    assert "Hunt findings saved to:" not in output
-    for repair in run.repairs:
-        assert str(repair.validated_patch_path) in output
+    assert output.rstrip().endswith("Report:\nunavailable")
+    assert "Artifact-save error" not in output
+
+
+def _finding(name, status, description="Concrete behavior is incorrect"):
+    hypothesis = BugHypothesis(name, "symbol", description, "private evidence", .99, "private reproduction")
+    return Finding(hypothesis, status, "private verifier diagnostic")
+
+
+@pytest.mark.parametrize(("checks", "expected"), [
+    ((CheckResult("pytest", ("pytest",), 0, "", "", 0),), "Baseline: PASS"),
+    ((CheckResult("pytest", ("pytest",), 1, "", "", 0),), "Baseline: FAIL (pytest)"),
+    ((CheckResult("pytest", ("pytest",), 1, "", "", 0),
+      CheckResult("ruff", ("ruff",), 1, "", "", 0)), "Baseline: FAIL (pytest, ruff)"),
+    ((), "Baseline: NOT AVAILABLE"),
+])
+def test_compact_baseline_status_shows_only_nonpassing_check_names(checks, expected, tmp_path):
+    run = HuntRun(checks, (), (), report_path=tmp_path / "hunt_report.md")
+    output = render_hunt_summary(run)
+    assert expected in output
+    assert "private" not in output
+
+
+def test_zero_counts_and_empty_unresolved_or_repair_sections_are_hidden(tmp_path):
+    run = HuntRun((), (), (), report_path=tmp_path / "hunt_report.md")
+    output = render_hunt_summary(run)
+    assert "Bugs found: 0" in output
+    assert "Confirmed:" not in output
+    assert "Unverifiable:" not in output
+    assert "Unresolved:" not in output
+    assert "Repairs verified:" not in output
+    assert "Repairs failed:" not in output
+    assert "Repairs blocked:" not in output
+
+
+def test_every_unresolved_finding_is_one_compact_line_and_long_text_is_shortened(tmp_path):
+    hypotheses = [
+        _finding("src/one.py", "high_confidence", "An unverified issue appears in this function."),
+        _finding("lib/two.py", "unconfirmed", "A second issue appears."),
+        _finding("lib/three.py", "high_confidence", "A lengthy behavioral hypothesis " + "detail " * 50),
+    ]
+    run = HuntRun((), tuple(hypotheses), (), report_path=tmp_path / "hunt_report.md")
+    output = render_hunt_summary(run)
+    lines = [line for line in output.splitlines() if line.startswith("- ")]
+    assert len(lines) == 3
+    assert lines[0] == "- src/one.py:symbol — An unverified issue appears in this function."
+    assert lines[1] == "- lib/two.py:symbol — A second issue appears."
+    assert len(lines[2]) <= 150 and lines[2].endswith("…")
+    assert "private verifier diagnostic" not in output
+    assert "99%" not in output
+
+
+@pytest.mark.parametrize(("repairs", "errors", "expected"), [
+    ((SimpleNamespace(finding_id="id", validation=SimpleNamespace(passed=True, final_status="TARGET FIX VERIFIED", targeted=None)),), (), "Repairs verified: 1"),
+    ((), ("id: invalid patch",), "Repairs failed: 1"),
+    ((SimpleNamespace(finding_id="id", validation=SimpleNamespace(passed=False, final_status="TARGETED VERIFICATION BLOCKED", targeted=None)),), (), "Repairs blocked: 1"),
+])
+def test_repair_counters_show_only_nonzero_outcomes(tmp_path, repairs, errors, expected):
+    finding = _finding("app.py", "confirmed")
+    finding = replace(finding, hypothesis=replace(finding.hypothesis, root_cause_key="id"))
+    # Repair results are keyed to the finding's canonical ID.
+    repairs = tuple(SimpleNamespace(finding_id=finding.finding_id, validation=repair.validation) for repair in repairs)
+    errors = tuple(error.replace("id:", finding.finding_id + ":") for error in errors)
+    output = render_hunt_summary(HuntRun((), (finding,), repairs, repair_errors=errors,
+                                         report_path=tmp_path / "hunt_report.md"))
+    assert expected in output
+    for zero_line in ("Repairs verified: 0", "Repairs failed: 0", "Repairs blocked: 0"):
+        assert zero_line not in output

@@ -16,7 +16,7 @@ from .models import (
     ValidationReport,
 )
 from .runner import run_checks
-from .validation import capture, evaluate, identity, syntax_check
+from .validation import capture, evaluate, identity, syntax_check, syntax_rejection
 from .workspace import InvalidUnifiedDiffError, PatchApplicabilityError, apply_unified_diff, isolated_workspace
 
 
@@ -53,13 +53,16 @@ class CheckValidator:
         self.baseline_syntax = syntax_check(project)
 
     def validate(self, project: ProjectInfo) -> ValidationReport:
+        syntax = syntax_check(project)
+        if syntax is not None and not syntax.passed:
+            return syntax_rejection(project, syntax, self.baseline)
         results = capture(run_checks(project, timeout_seconds=self.timeout_seconds, stop_on_failure=False))
         target = next((r for r in results if self.failure and identity(r) == identity(self.failure)), None)
         if self.failure is None:
             target = CheckResult("discovered checks", (), 0 if results and all(r.passed for r in results) else 1, "", "", 0)
         elif target is None:
             target = CheckResult(self.failure.name, self.failure.command, 1, "", "Original failing check was not executed", 0)
-        return evaluate(project, target, results, self.baseline, syntax_check(project), self.baseline_syntax)
+        return evaluate(project, target, results, self.baseline, syntax, self.baseline_syntax)
 
 
 class DebugOrchestrator:
@@ -132,7 +135,17 @@ class DebugOrchestrator:
                     context = replace(context, patch_feedback=tuple(patch_errors))
                     continue
                 proposals.append(proposal)
-                validation = self.validator.validate(isolated_project)
+                syntax = syntax_check(isolated_project, originals)
+                if not syntax.passed:
+                    patch_errors.append(f"Attempt {attempt}: repair syntax pre-validation failed: {syntax.stderr}")
+                    pin = getattr(self.validator, "pinned_plan", None) or {}
+                    mechanism = pin.get("verifier", "restricted-ast-runtime")
+                    validation = syntax_rejection(isolated_project, syntax, getattr(self.validator, "baseline", ()),
+                                                  confirmation_verifier=mechanism, repair_verifier=mechanism)
+                else:
+                    validation = self.validator.validate(isolated_project)
+                    if validation.syntax is None:
+                        validation = replace(validation, syntax=syntax)
                 if validation.passed:
                     run = DebugRun(initial_context, analysis, tuple(proposals), validation, attempt,
                                    patch_errors=tuple(patch_errors), finding_id=finding_id)
@@ -154,4 +167,4 @@ class DebugOrchestrator:
 
         assert analysis is not None and proposal is not None and validation is not None
         return DebugRun(initial_context, analysis, tuple(proposals), validation, attempt,
-                        patch_errors=tuple(patch_errors))
+                        patch_errors=tuple(patch_errors), finding_id=finding_id)

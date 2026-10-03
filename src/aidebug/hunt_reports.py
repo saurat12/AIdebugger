@@ -20,8 +20,8 @@ def save_hunt_report(root, run):
              *[f"- {strategy}" for strategy in run.strategies], "",
              "Read-only review uses bounded source excerpts and code tools. Python static strategies scan up to 300 entries / 1 MB; generated checks use at most 64 numeric cases per function. Strategies do not cover every language or behavior.", "",
              "Coverage-gap analysis uses coverage.json when available; otherwise it checks direct Python test references as a heuristic, not measured coverage. Supplied coverage can be stale; indirect test calls can be missed.", "",
-             "Verification plans are strict JSON operation lists. They can call public local symbols, construct objects, inspect state and argument mutation, capture bounded stdout/stderr, use deterministic random stubs, virtual files, and enforce a subprocess deadline. The worker runs in an isolated project copy with a minimal environment and interprets an AST allowlist; it does not import target modules or execute generated Python/shell. The optional model planner only proposes plan data, which is schema-validated before execution.", "",
-             "Verification fallback: run an existing structured reproduction first; if missing, ask the planner for a restricted operation plan; registered specialized/static verifiers may supply additional independent evidence. If no supported safe path establishes or contradicts the claim, retain it as HIGH_CONFIDENCE or UNVERIFIABLE. A generated harness is never run as arbitrary source code.", "",
+             "Verification plans are strict JSON operation lists. They can call safe local symbols, construct objects, inspect state and argument mutation, capture bounded stdout/stderr, use deterministic stubs, virtual files, and enforce a subprocess deadline. The worker runs in an isolated project copy with a minimal environment and interprets an AST allowlist; it does not import target modules or execute generated Python/shell.", "",
+             "Verification routes through deterministic capabilities, supplied or cached structured plans, and bounded reproduction data. If no supported safe path establishes or contradicts the claim, retain it as HIGH_CONFIDENCE or UNVERIFIABLE. A generated harness is never run as arbitrary source code.", "",
              "## Existing Surfaced Failures", ""]
     failures = [result for result in run.existing_checks if not result.passed]
     lines.extend([f"Project-wide validation: {project_status(run.existing_checks)}", ""])
@@ -42,7 +42,9 @@ def save_hunt_report(root, run):
                   f"- Safe plan coverage: {run.verification_metrics['verification_coverage']:.0%}",
                   f"- Plans independently executed to a conclusion: {run.verification_metrics['verification_plans_executed']}",
                   f"- Pinned plans reused after repair: {run.verification_metrics['pinned_plans_reused']}",
-                  f"- Plans requiring replanning: {run.verification_metrics['plans_requiring_replanning']}",
+                  f"- Cached-plan conclusions: {run.verification_metrics['cached_plan_conclusions']}",
+                  f"- Structured-spec conclusions: {run.verification_metrics['structured_spec_conclusions']}",
+                  f"- Reproduction-builder conclusions: {run.verification_metrics['reproduction_builder_conclusions']}",
                   f"- Unsupported AST capabilities: {run.verification_metrics['unsupported_ast_capabilities']}",
                   f"- Unsupported module-fragment cases: {run.verification_metrics['unsupported_module_fragment_cases']}",
                   f"- Module-fragment cases: {run.verification_metrics['module_fragment_cases']}",
@@ -61,10 +63,12 @@ def save_hunt_report(root, run):
             record = finding.record()
             lines.extend([f"### {record['finding_id']} — {record['verification_status']}", "",
                           f"File: {record['file']} — symbol: {record['symbol']}", "",
+                          f"Verification target: {record['verification_target']}", "",
                           f"Category: {record['category']}; confidence: {record['confidence']:.0%}", "",
                           f"Hypothesis: {record['hypothesis']}", "", f"Evidence: {record['evidence']}", "",
                           f"Reproduction strategy: {record['reproduction_strategy']}", "",
                           f"Verification evidence: {record['verification_evidence']}", "",
+                          f"Confirmation source: {(record.get('verification_plan') or {}).get('source', 'not recorded')}", "",
                           f"Verification state: {record['verification_state']}",
                           f"Repair authorization: {record['repair_authorization']}", ""])
             if record.get("verification_plan"):
@@ -76,6 +80,20 @@ def save_hunt_report(root, run):
                     lines.extend([f"- {signal['detector']}: {claim['description']} (confidence {claim['confidence']:.0%}; {signal['verification_status']})",
                                   f"  Evidence: {json.dumps(claim['evidence'], ensure_ascii=True)}",
                                   f"  Verification: {signal['verification_evidence']}"])
+    lines.extend(["", "## Unverified Bugs", ""])
+    unresolved = [finding for finding in run.bug_findings if finding.status in ("high_confidence", "unconfirmed")]
+    lines.extend(f"- {finding.finding_id}: {finding.hypothesis.suspected_file}: {finding.evidence}" for finding in unresolved)
+    if not unresolved:
+        lines.append("None recorded.")
+    lines.extend(["", "## Syntax-Blocked Finding Retries", ""])
+    retried = [finding for finding in run.bug_findings if (finding.verification_plan or {}).get("retried_after_syntax_repair")]
+    pending_syntax = [finding for finding in unresolved if (finding.verification_plan or {}).get("unsupported_reason") ==
+                      "Behavioral verification blocked by a separate syntax defect"]
+    lines.extend(f"- {finding.finding_id}: retried after syntax repair {(finding.verification_plan or {})['retried_after_syntax_repair']}; "
+                 f"result {finding.status}; verified in an isolated workspace only." for finding in retried)
+    lines.extend(f"- {finding.finding_id}: not retried; no validated syntax repair was available." for finding in pending_syntax)
+    if not retried and not pending_syntax:
+        lines.append("No findings were awaiting a syntax repair.")
     lines.extend(["## Repair Outcomes", ""])
     for repair in run.repairs:
         lines.append(f"- {repair.finding_id}: {'Validated' if repair.validation and repair.validation.passed else 'Not validated'} after {repair.attempts} attempt(s)")

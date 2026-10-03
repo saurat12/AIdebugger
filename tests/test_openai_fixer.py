@@ -13,7 +13,7 @@ from aidebug.workspace import InvalidUnifiedDiffError, PatchApplicabilityError, 
 from aidebug.models import PatchProposal
 
 
-PATCH = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-return 1\n+return 2\n"
+PATCH = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
 ANALYSIS = AnalysisReport("wrong return", 0.9, "Expected another value")
 SECRET = "private-credential-never-display"
 
@@ -26,7 +26,7 @@ def fixer_json(payload):
 
 
 def setup_fixer(tmp_path, text, **response_fields):
-    (tmp_path / "app.py").write_text("return 1\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     project = ProjectInfo(tmp_path, ("python",), ())
     failure = CheckResult("test", ("test",), 1, "", "failed", 0.01)
     context = build_debug_context(project, failure)
@@ -48,8 +48,8 @@ def test_valid_fixer_response_applies_in_isolation(tmp_path, text):
     assert isinstance(proposal.explanation, str)
     with isolated_workspace(tmp_path) as workspace:
         apply_unified_diff(workspace, proposal.unified_diff)
-        assert (workspace / "app.py").read_text() == "return 2\n"
-    assert (tmp_path / "app.py").read_text() == "return 1\n"
+        assert (workspace / "app.py").read_text() == "value = 2\n"
+    assert (tmp_path / "app.py").read_text() == "value = 1\n"
 
 
 @pytest.mark.parametrize("payload, diagnostic", [
@@ -104,7 +104,7 @@ def test_incomplete_response_is_rejected_even_with_parseable_text(tmp_path, stat
     (PATCH.replace("@@ -1 +1 @@", "@@ -1,2 +1 @@"), "line counts"),
     (PATCH + SECRET + "\n", "Invalid unified diff line"),
     (PATCH.replace("b/app.py", "b/../../" + SECRET), "escapes workspace"),
-    (PATCH.replace("-return 1", "-stale " + SECRET), "does not match"),
+    (PATCH.replace("-value = 1", "-stale " + SECRET), "does not match"),
 ])
 def test_malformed_or_unsafe_patches_never_reach_validator(tmp_path, patch, diagnostic):
     agent, context = setup_fixer(tmp_path, fixer_json({"unified_diff": patch}))
@@ -114,12 +114,12 @@ def test_malformed_or_unsafe_patches_never_reach_validator(tmp_path, patch, diag
         DebugOrchestrator(analyzer, agent, validator).run(context.project, context.failed_check)
     assert SECRET not in "".join(traceback.format_exception(error.value))
     validator.validate.assert_not_called()
-    assert (tmp_path / "app.py").read_text() == "return 1\n"
+    assert (tmp_path / "app.py").read_text() == "value = 1\n"
 
 
 def test_openai_fixer_cumulative_retry_patches(tmp_path):
     agent, context = setup_fixer(tmp_path, PATCH)
-    second_patch = PATCH.replace("-return 1", "-return 2").replace("+return 2", "+return 3")
+    second_patch = PATCH.replace("-value = 1", "-value = 2").replace("+value = 2", "+value = 3")
     agent.client.responses.create.side_effect = [
         SimpleNamespace(output=[], output_text=fixer_json({"unified_diff": PATCH})),
         SimpleNamespace(output=[], output_text=fixer_json({"unified_diff": second_patch})),
@@ -130,7 +130,7 @@ def test_openai_fixer_cumulative_retry_patches(tmp_path):
 
         def validate(self, project):
             self.calls += 1
-            assert (project.root / "app.py").read_text() == f"return {self.calls + 1}\n"
+            assert (project.root / "app.py").read_text() == f"value = {self.calls + 1}\n"
             result = CheckResult("test", ("test",), 0 if self.calls == 2 else 1, "", "failed", 0.01)
             return ValidationReport(result.passed, (result,), project.root)
 
@@ -139,7 +139,7 @@ def test_openai_fixer_cumulative_retry_patches(tmp_path):
     assert result.validation.passed
     assert result.attempts == 2
     assert [p.unified_diff for p in result.proposals] == [PATCH, second_patch]
-    assert (tmp_path / "app.py").read_text() == "return 1\n"
+    assert (tmp_path / "app.py").read_text() == "value = 1\n"
 
 
 def test_pending_tool_calls_are_not_treated_as_a_final_patch(tmp_path):
@@ -169,7 +169,7 @@ def test_json_envelope_defers_all_diff_validation_to_workspace(tmp_path, patch):
         with pytest.raises(InvalidUnifiedDiffError, match="Invalid unified diff") as error:
             apply_unified_diff(workspace, proposal.unified_diff)
     assert SECRET not in str(error.value)
-    assert (tmp_path / "app.py").read_text() == "return 1\n"
+    assert (tmp_path / "app.py").read_text() == "value = 1\n"
 
 
 def test_plain_response_requires_structured_status(tmp_path):
@@ -179,7 +179,7 @@ def test_plain_response_requires_structured_status(tmp_path):
 
 
 @pytest.mark.parametrize("patch", [
-    PATCH.replace("-return 1", "-stale " + SECRET),
+    PATCH.replace("-value = 1", "-stale " + SECRET),
     PATCH.replace("a/app.py", "a/missing.py"),
     PATCH.replace("@@ -1 +1 @@", "@@ -100 +100 @@"),
 ])
@@ -190,7 +190,7 @@ def test_non_applicable_patches_have_distinct_errors(tmp_path, patch):
         with pytest.raises(PatchApplicabilityError, match="Patch does not apply to the isolated workspace") as error:
             apply_unified_diff(workspace, proposal.unified_diff)
     assert SECRET not in str(error.value)
-    assert (tmp_path / "app.py").read_text() == "return 1\n"
+    assert (tmp_path / "app.py").read_text() == "value = 1\n"
 
 
 @pytest.mark.parametrize("payload", [
@@ -230,7 +230,11 @@ def test_no_patch_stops_without_applying_or_validating(tmp_path, monkeypatch, af
     assert result.proposals[-1].status == "no_patch"
     assert result.proposals[-1].explanation == reason
     assert result.attempts == (2 if after_patch else 1)
-    assert result.validation == (validation if after_patch else None)
+    if after_patch:
+        assert result.validation.results == validation.results
+        assert not result.validation.passed and result.validation.syntax.passed
+    else:
+        assert result.validation is None
     assert apply.call_count == int(after_patch)
     assert validator.validate.call_count == int(after_patch)
-    assert (tmp_path / "app.py").read_text() == "return 1\n"
+    assert (tmp_path / "app.py").read_text() == "value = 1\n"

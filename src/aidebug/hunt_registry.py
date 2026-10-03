@@ -23,6 +23,13 @@ class VerifierEntry:
     factory: object
 
 
+@dataclass(frozen=True)
+class CapabilityVerifierEntry:
+    name: str
+    supports: object
+    factory: object
+
+
 class DetectorRegistry:
     def __init__(self):
         self.entries = []
@@ -39,6 +46,7 @@ class DetectorRegistry:
 class VerifierRegistry:
     def __init__(self):
         self.entries = []
+        self.capabilities = []
 
     def register(self, name, supports, factory):
         if any(entry.name == name for entry in self.entries):
@@ -48,6 +56,17 @@ class VerifierRegistry:
     def resolve(self, item, quick=False):
         for entry in self.entries:
             if entry.supports(item):
+                return entry.factory(quick)
+        return None
+
+    def register_capability(self, name, supports, factory):
+        if any(entry.name == name for entry in self.capabilities):
+            raise ValueError("Duplicate verifier capability: " + name)
+        self.capabilities.append(CapabilityVerifierEntry(name, supports, factory))
+
+    def resolve_capability(self, project, item, quick=False):
+        for entry in self.capabilities:
+            if entry.supports(project, item):
                 return entry.factory(quick)
         return None
 
@@ -63,6 +82,9 @@ class RegistryVerifier:
         self.registry = registry if registry is not None else verifier_registry()
 
     def prepare_repair(self, project, item):
+        from .static_absence import absence_spec
+        if absence_spec(item) is not None:
+            return None  # Absence alone supplies no positive post-repair behavior.
         handler = self.registry.resolve(item, self.quick)
         if handler is not None and hasattr(handler, "prepare_repair"):
             return handler.prepare_repair(project, item)
@@ -86,6 +108,11 @@ class RegistryVerifier:
                       "Non-bug observation is excluded from behavioral bug verification.")
             return Finding(item, "unconfirmed", reason)
         try:
+            capability = self.registry.resolve_capability(project, item, self.quick)
+            if capability is not None:
+                result = capability.verify(project, item)
+                if result is not None:
+                    return result
             handler = self.registry.resolve(item, self.quick)
             if handler is None:
                 return unsupported(item, "No registered verifier supports this reproduction; hypothesis retained, no automatic repair authorized.")
@@ -108,6 +135,10 @@ def _normalized(text):
 def same_cause(left, right):
     if left.is_bug != right.is_bug:
         return False
+    from .syntax_findings import syntax_identity
+    left_syntax, right_syntax = syntax_identity(left), syntax_identity(right)
+    if left_syntax is not None or right_syntax is not None:
+        return left_syntax is not None and left_syntax == right_syntax
     a, b = left.hypothesis, right.hypothesis
     if (a.suspected_file.replace("\\", "/"), a.suspected_symbol) != (b.suspected_file.replace("\\", "/"), b.suspected_symbol):
         return False
@@ -118,8 +149,9 @@ def same_cause(left, right):
     return _normalized(a.description) == _normalized(b.description)
 
 
-def collect_findings(project, checks, detectors, verifier, cached_plans=None, planner_agent=None):
-    from .verification import VerificationPlanner
+def collect_findings(project, checks, detectors, verifier, cached_plans=None):
+    from .verification import KINDS, _syntax_evidence_matches, resolve_verification_spec
+    from .syntax_findings import discover_syntax_findings
     from .finding_scope import is_non_bug_hypothesis
     from .hunt import Finding
     from .hunt import DoctestVerifier
@@ -136,7 +168,19 @@ def collect_findings(project, checks, detectors, verifier, cached_plans=None, pl
         adapter_registry = VerifierRegistry()
         adapter_registry.register("injected_adapter", lambda item: True, lambda quick: verifier)
         active_verifier = RegistryVerifier(registry=adapter_registry)
-    findings = []
+    findings = list(discover_syntax_findings(project))
+    for index, syntax in enumerate(findings):
+        location = syntax.hypothesis.evidence
+        for check in checks:
+            if check.passed or check.blocked_reason:
+                continue
+            output = (check.stdout + "\n" + check.stderr).replace("\\", "/")[:12000]
+            marker = rf"(?<![\w/]){re.escape(location['file'])}:{location['line']}:{location['column']}:\s*{re.escape(location['parser_error'])}:"
+            if re.search(marker, output):
+                signal = {"detector": "ExistingCheck", "check": check.name,
+                          "hypothesis": asdict(syntax.hypothesis), "verification_status": "confirmed",
+                          "verification_evidence": f"{check.name} reported the same parser location and error class"}
+                findings[index] = replace(findings[index], signals=(*findings[index].signals, signal))
     for detector in detectors:
         items = detector.hunt_with_checks(project, checks) if hasattr(detector, "hunt_with_checks") else detector.hunt(project)
         for item in items:
@@ -155,32 +199,67 @@ def collect_findings(project, checks, detectors, verifier, cached_plans=None, pl
                     previous = findings[match]
                     findings[match] = replace(previous, signals=(*previous.signals, signal))
                 continue
-            planner = VerificationPlanner(planner_agent)
-            try:
-                plan = planner.plan(project, item, cached_plans)
-                if plan and plan.get("plan") is not None:
-                    item = replace(item, verification_spec=plan["plan"])
-            except Exception as exc:
-                plan = {"schema_version": 1, "file": item.suspected_file, "symbol": item.suspected_symbol,
-                        "plan": None, "unsupported_reason": f"Planner unavailable or plan failed strict validation ({type(exc).__name__}: {str(exc)[:180]})."}
-                item = replace(item, verification_unsupported=plan["unsupported_reason"])
-            if plan is None:
-                reason = "Planner returned no safe structured plan; expected behavior or a bounded reproduction is unsupported."
-                if framework_routed:
-                    item = replace(item, verification_unsupported=reason)
-            elif plan.get("plan") is not None:
-                plan.setdefault("verifier", "declared-doctest-adapter" if plan["plan"].get("kind") == "doctest" else "restricted-ast-runtime")
+            if item.verification_spec is None and item.verification_plan is None and isinstance(item.evidence, dict):
+                declared_error = item.evidence.get("parser_error", item.evidence.get("error_type"))
+                if isinstance(declared_error, str) and declared_error in {"SyntaxError", "IndentationError", "TabError"}:
+                    matching_syntax = next((candidate for candidate in findings
+                                            if (candidate.verification_plan or {}).get("capability") == "parse_compile"
+                                            and candidate.hypothesis.suspected_file == item.suspected_file
+                                            and isinstance(candidate.hypothesis.evidence, dict)
+                                            and candidate.hypothesis.evidence.get("parser_error") == declared_error
+                                            and _syntax_evidence_matches(item, candidate.hypothesis.evidence["line"],
+                                                                         candidate.hypothesis.evidence["column"])), None)
+                    if matching_syntax is not None:
+                        item = replace(item, verification_spec=matching_syntax.hypothesis.verification_spec)
+            supplied_plan = item.verification_plan is not None or item.verification_spec is not None or (
+                isinstance(item.reproduction, dict) and item.reproduction.get("kind") in
+                KINDS - {"verification_plan", "doctest"})
             try:
                 finding = active_verifier.verify(project, item)
             except Exception as exc:
                 finding = unsupported(item, f"Verification unavailable ({type(exc).__name__}); hypothesis retained without confirmation.")
+            deterministic_terminal = finding.status in ("confirmed", "rejected")
+            capability_handled = bool(finding.verification_plan and
+                                      finding.verification_plan.get("source") == "deterministic_verifier")
+            try:
+                plan = finding.verification_plan if capability_handled else resolve_verification_spec(project, item, cached_plans)
+                if plan and plan.get("plan") is not None and not capability_handled:
+                    item = replace(item, verification_spec=plan["plan"],
+                                   verification_target=plan.get("verification_target", item.verification_target))
+            except Exception as exc:
+                if deterministic_terminal:
+                    plan = finding.verification_plan or {"schema_version": 1, "file": item.suspected_file,
+                                                         "symbol": item.suspected_symbol, "plan": None,
+                                                         "source": "deterministic_verifier"}
+                else:
+                    from .reproduction import validation_diagnostic
+                    diagnostic = validation_diagnostic(exc)
+                    reason = f"UNVERIFIABLE: {diagnostic['failure_kind']} at {diagnostic['field']}: {diagnostic['reason']}"
+                    plan = {"schema_version": 1, "file": item.suspected_file, "symbol": item.suspected_symbol,
+                            "plan": None, "source": "structured_spec_resolution" if supplied_plan else "deterministic_reproduction_builder",
+                            "unsupported_reason": reason, "validation_error": diagnostic}
+                    item = replace(item, verification_unsupported=reason)
+                    finding = unsupported(item, reason)
+            if plan is not None and plan.get("plan") is not None and not capability_handled:
+                plan.setdefault("verifier", "declared-doctest-adapter" if plan["plan"].get("kind") == "doctest" else "restricted-ast-runtime")
+                if not deterministic_terminal and (item.verification_spec != plan["plan"] or finding.hypothesis != item):
+                    try:
+                        finding = active_verifier.verify(project, item)
+                    except Exception as exc:
+                        finding = unsupported(item, f"Verification unavailable ({type(exc).__name__}); hypothesis retained without confirmation.")
             signal = {"detector": type(detector).__name__, "hypothesis": asdict(item),
                       "verification_status": finding.status, "verification_evidence": finding.evidence,
                       "finding_id": finding.finding_id}
+            if plan is None and finding.verification_plan is not None:
+                plan = finding.verification_plan
             if plan is None:
                 plan = {"schema_version": 1, "file": item.suspected_file, "symbol": item.suspected_symbol,
-                        "plan": None, "verifier": "restricted-ast-runtime",
-                        "unsupported_reason": item.verification_unsupported}
+                        "plan": None,
+                        "source": ("deterministic_verifier" if finding.status in ("confirmed", "rejected") else
+                                   "unresolved_without_safe_plan"),
+                        "verifier": "deterministic-capability" if finding.status in ("confirmed", "rejected") else "restricted-ast-runtime",
+                        "unsupported_reason": item.verification_unsupported or
+                                              (finding.evidence if finding.status not in ("confirmed", "rejected") else None)}
             repairability = None
             if finding.status == "confirmed" and finding.is_bug:
                 try:
@@ -197,7 +276,7 @@ def collect_findings(project, checks, detectors, verifier, cached_plans=None, pl
                         repairability = "blocked_positive_oracle_unsupported" if has_expected else "blocked_expected_behavior_unknown"
                 except Exception:
                     repairability = "blocked_positive_oracle_unsupported"
-            finding = replace(finding, signals=(signal,), verification_plan=plan, repairability=repairability)
+            finding = replace(finding, hypothesis=item, signals=(signal,), verification_plan=plan, repairability=repairability)
             match = next((i for i, previous in enumerate(findings) if same_cause(previous, finding)), None)
             if match is None:
                 findings.append(finding)
@@ -245,8 +324,14 @@ def verifier_registry():
     global _verifiers
     if _verifiers is None:
         from .verification import StructuredVerifier, KINDS
+        from .static_absence import StaticAbsenceVerifier, absence_spec
         from .hunt import DoctestVerifier
         registry = VerifierRegistry()
+        from .verification import PythonSyntaxVerifier
+        registry.register_capability("static_absence", lambda project, item: absence_spec(item) is not None,
+                                     lambda quick: StaticAbsenceVerifier())
+        registry.register_capability("python_parse", lambda project, item: item.suspected_file.casefold().endswith(".py"),
+                                     lambda quick: PythonSyntaxVerifier())
         registry.register("declared_doctest_adapter", lambda item: isinstance(item.verification_spec, dict) and item.verification_spec.get("kind") == "doctest",
                           lambda quick: DoctestVerifier())
         registry.register("structured", lambda item: isinstance(item.verification_spec, dict) and item.verification_spec.get("kind") in KINDS - {"doctest"},

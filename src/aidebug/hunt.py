@@ -16,7 +16,7 @@ from .code_tools import CodeTools
 from .models import CheckResult, DebugRun, ProjectInfo, ValidationReport
 from .openai_agent import OpenAIAgent, _json_object
 from .runner import run_checks
-from .validation import capture, evaluate, syntax_check, summary, project_status
+from .validation import capture, evaluate, syntax_check, syntax_rejection, summary
 from .workspace import InvalidUnifiedDiffError, PatchApplicabilityError, isolated_workspace
 
 
@@ -36,6 +36,7 @@ class BugHypothesis:
     behavioral_failure: str | None = None
     verification_plan: dict | None = None
     verification_unsupported: str | None = None
+    verification_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,13 @@ class Finding:
     def record(self) -> dict:
         hypothesis = self.hypothesis
         return dict(finding_id=self.finding_id, file=hypothesis.suspected_file,
-                    symbol=hypothesis.suspected_symbol, category=hypothesis.category,
+                    symbol=hypothesis.suspected_symbol, suspected_symbol=hypothesis.suspected_symbol,
+                    verification_target=(hypothesis.verification_target or (self.verification_plan or {}).get("verification_target") or
+                                         (hypothesis.verification_plan.get("verification_target") if isinstance(hypothesis.verification_plan, dict) else None) or
+                                         (hypothesis.verification_spec.get("verification_target") if isinstance(hypothesis.verification_spec, dict) else None) or
+                                         (hypothesis.reproduction.get("verification_target", hypothesis.reproduction.get("target"))
+                                          if isinstance(hypothesis.reproduction, dict) else None) or hypothesis.suspected_symbol),
+                    category=hypothesis.category,
                     hypothesis=hypothesis.description, evidence=hypothesis.evidence,
                     confidence=hypothesis.confidence, reproduction_strategy=hypothesis.reproduction_strategy,
                     verification_status=self.status, verification_evidence=self.evidence,
@@ -150,8 +157,13 @@ class HuntRun:
         return {"verification_coverage": len(planned) / len(self.bug_findings) if self.bug_findings else 1.0,
                 "verification_plans_generated": len(planned),
                 "verification_plans_executed": sum(f.status in ("confirmed", "rejected") for f in planned),
+                "cached_plan_conclusions": sum(f.status in ("confirmed", "rejected") and
+                    (f.verification_plan or {}).get("source") == "validated_cache" for f in self.bug_findings),
+                "structured_spec_conclusions": sum(f.status in ("confirmed", "rejected") and
+                    (f.verification_plan or {}).get("source") in {"hunter_plan", "structured_hypothesis"} for f in self.bug_findings),
+                "reproduction_builder_conclusions": sum(f.status in ("confirmed", "rejected") and
+                    (f.verification_plan or {}).get("source") == "deterministic_reproduction_builder" for f in self.bug_findings),
                 "pinned_plans_reused": sum(report.plan_reused for report in validations),
-                "plans_requiring_replanning": sum(report.replanned for report in validations),
                 "unsupported_ast_capabilities": len(unsupported),
                 "unsupported_module_fragment_cases": sum(bool(f.verification_plan and
                     (f.verification_plan.get("plan") or {}).get("kind") == "module_fragment") and f in unsupported for f in self.bug_findings),
@@ -388,17 +400,20 @@ class DoctestVerifier:
 
 class VerifiedRepairValidator:
     def __init__(self, verifier: VerificationStrategy, hypothesis: BugHypothesis, timeout: float, original: ProjectInfo,
-                 baseline=(), baseline_syntax=None, pinned_plan=None, planner_agent=None):
+                 baseline=(), baseline_syntax=None, pinned_plan=None):
         self.verifier, self.hypothesis, self.timeout = verifier, hypothesis, timeout
+        self.pinned_plan = pinned_plan
         self.contract = self._contract(original)
         self.baseline, self.baseline_syntax = capture(baseline), baseline_syntax
-        self.pinned_plan = pinned_plan
-        self.planner_agent = planner_agent
         self.repair_hypothesis = hypothesis
         if pinned_plan and isinstance(pinned_plan.get("plan"), dict):
             from .verification import validate_spec
             exact = validate_spec(pinned_plan["plan"])
             self.repair_hypothesis = replace(hypothesis, verification_spec=exact, verification_plan=exact)
+            if hasattr(verifier, "prepare_repair"):
+                prepared = verifier.prepare_repair(original, self.repair_hypothesis)
+                self.repair_hypothesis = (replace(prepared, verification_plan=prepared.verification_spec)
+                                          if prepared is not None else None)
         elif hasattr(verifier, "prepare_repair"):
             self.repair_hypothesis = verifier.prepare_repair(original, hypothesis)
         elif hypothesis.verification_spec is not None:
@@ -406,6 +421,9 @@ class VerifiedRepairValidator:
             self.repair_hypothesis = prepare_repair_hypothesis(original, hypothesis)
 
     def _contract(self, project: ProjectInfo):
+        spec = (self.pinned_plan or {}).get("plan") or self.hypothesis.verification_spec or {}
+        if spec.get("kind") == "python_syntax":
+            return None  # Syntax verification needs no successfully parsed callable contract.
         if hasattr(self.verifier, "contract"):
             return self.verifier.contract(project, self.hypothesis)
         if not isinstance(self.verifier, DoctestVerifier):
@@ -417,26 +435,12 @@ class VerifiedRepairValidator:
             return ()
 
     def validate(self, project: ProjectInfo) -> ValidationReport:
+        mechanism = (self.pinned_plan or {}).get("verifier", "restricted-ast-runtime")
+        syntax = syntax_check(project)
+        if syntax is not None and not syntax.passed:
+            return syntax_rejection(project, syntax, self.baseline, confirmation_verifier=mechanism,
+                                    repair_verifier=mechanism, plan_reused=bool(self.pinned_plan))
         finding = self.verifier.verify(project, self.repair_hypothesis) if self.repair_hypothesis else None
-        replanned, replan_reason = False, None
-        if (self.pinned_plan and finding is not None and finding.status in ("unconfirmed", "high_confidence")
-                and (finding.evidence.startswith("UNVERIFIABLE:") or "unsupported" in finding.evidence.casefold()
-                     or "not defined" in finding.evidence.casefold())):
-            # A changed source can make a formerly valid binding/statement
-            # structurally unavailable. Replanning is explicit and generic;
-            # never substitute doctest or another implicit adapter.
-            from .verification import VerificationPlanner
-            try:
-                candidate = replace(self.hypothesis, verification_spec=None, verification_plan=None, reproduction=None)
-                plan = VerificationPlanner(self.planner_agent).plan(project, candidate)
-                if plan and isinstance(plan.get("plan"), dict):
-                    candidate = replace(candidate, verification_spec=plan["plan"], verification_plan=plan["plan"])
-                    finding = self.verifier.verify(project, candidate)
-                    replanned, replan_reason = True, "Pinned plan was unsupported after repair; generic planner produced a replacement plan."
-                else:
-                    replan_reason = "Pinned plan was unsupported after repair; generic planner could not produce a replacement plan."
-            except (ValueError, OSError, TypeError) as exc:
-                replan_reason = f"Pinned plan was unsupported after repair; generic replanning failed ({type(exc).__name__})."
         if finding is None:
             finding = Finding(self.hypothesis, "unconfirmed", "No positive corrected behavior was specified; absence of the old exception cannot validate a repair")
         reproduction = finding.check or CheckResult("hunt:targeted-verification", ("restricted-verifier",), 1, "", finding.evidence or "Targeted verification unavailable", 0)
@@ -446,14 +450,14 @@ class VerifiedRepairValidator:
             reproduction = replace(reproduction, returncode=1, stderr="Declared reproduction contract changed; repair cannot be validated")
         results = run_checks(project, self.timeout, stop_on_failure=False)
         expected = json.dumps(self.repair_hypothesis.verification_spec, sort_keys=True) if self.repair_hypothesis and self.repair_hypothesis.verification_spec else "Pinned declared verification plan must pass"
-        report = evaluate(project, reproduction, results, self.baseline, syntax_check(project), self.baseline_syntax, expected)
+        report = evaluate(project, reproduction, results, self.baseline, syntax, self.baseline_syntax, expected)
         blocked = bool(finding.status in ("unconfirmed", "high_confidence") and
-                       ("unsupported" in finding.evidence.casefold() or "not defined" in finding.evidence.casefold()))
+                       (finding.evidence.startswith("UNVERIFIABLE:") or "unsupported" in finding.evidence.casefold()
+                        or "not defined" in finding.evidence.casefold()))
         return replace(report, final_status="TARGETED VERIFICATION BLOCKED" if blocked else report.final_status,
                        passed=False if blocked else report.passed,
-                       confirmation_verifier=(self.pinned_plan or {}).get("verifier", "restricted-ast-runtime"),
-                       repair_verifier="restricted-ast-runtime", plan_reused=bool(self.pinned_plan and not replanned),
-                       replanned=replanned, replan_reason=replan_reason)
+                       confirmation_verifier=mechanism,
+                       repair_verifier=mechanism, plan_reused=bool(self.pinned_plan))
 
 
 def hunt_project(project: ProjectInfo, detectors: tuple[DetectionStrategy, ...], verifier: VerificationStrategy,
@@ -467,20 +471,53 @@ def hunt_project(project: ProjectInfo, detectors: tuple[DetectionStrategy, ...],
         results = capture(run_checks(isolated, timeout, stop_on_failure=False))
         baseline_syntax = syntax_check(isolated)
         from .hunt_registry import collect_findings
-        findings = collect_findings(isolated, results, detectors, verifier, cached_plans, agent)
+        findings = collect_findings(isolated, results, detectors, verifier, cached_plans)
     repairs = []
     errors = []
-    for finding in findings:
+    for finding in tuple(findings):
         if not finding.is_bug or not finding.repair_authorized or finding.status != "confirmed" or finding.check is None or finding.check.passed:
             continue
         try:
             validator = VerifiedRepairValidator(verifier, finding.hypothesis, timeout, project, results, baseline_syntax,
-                                                pinned_plan=finding.verification_plan, planner_agent=agent)
+                                                pinned_plan=finding.verification_plan)
+            syntax_context = ("\nBounded syntax evidence: " + json.dumps(finding.hypothesis.evidence, ensure_ascii=True)[:1800]
+                              if (finding.verification_plan or {}).get("capability") == "parse_compile" else "")
             repair = DebugOrchestrator(agent, agent, validator).run(
                 project, replace(finding.check, stderr=finding.check.stderr + "\nTarget hypothesis: " + finding.hypothesis.description
-                                 + "\nPinned verification contract: " + json.dumps(finding.hypothesis.verification_spec or finding.hypothesis.reproduction)),
+                                 + syntax_context + "\nPinned verification contract: " + json.dumps(finding.hypothesis.verification_spec or finding.hypothesis.reproduction)),
                 changed_files={Path(finding.hypothesis.suspected_file)}, finding_id=finding.finding_id)
             repairs.append(replace(repair, finding_id=finding.finding_id))
+            if (finding.verification_plan or {}).get("capability") == "parse_compile" and repair.validation and repair.validation.passed and repair.validated_patch_path:
+                blocked = [(index, pending) for index, pending in enumerate(findings)
+                           if pending.hypothesis.suspected_file == finding.hypothesis.suspected_file
+                           and pending.finding_id != finding.finding_id
+                           and pending.status in ("high_confidence", "unconfirmed")
+                           and (pending.verification_plan or {}).get("unsupported_reason") == "Behavioral verification blocked by a separate syntax defect"]
+                if blocked:
+                    from .hunt_registry import collect_findings, same_cause
+                    from .workspace import apply_unified_diff
+
+                    class RetryDetector:
+                        def hunt(self, _project):
+                            return tuple(pending.hypothesis for _, pending in blocked)
+
+                    try:
+                        with isolated_workspace(project.root) as retry_workspace:
+                            apply_unified_diff(retry_workspace, repair.validated_patch_path.read_text(encoding="utf-8"))
+                            retried = collect_findings(replace(project, root=retry_workspace), results,
+                                                       (RetryDetector(),), verifier, cached_plans)
+                        for index, pending in blocked:
+                            result = next((candidate for candidate in retried if same_cause(candidate, pending)), None)
+                            if result is None:
+                                continue
+                            marker = {**(result.verification_plan or {}), "retried_after_syntax_repair": finding.finding_id,
+                                      "retry_workspace_only": True}
+                            repairability = ("blocked_pending_syntax_apply" if result.repair_authorized else result.repairability)
+                            findings[index] = replace(result, signals=(*pending.signals, *result.signals),
+                                                      verification_plan=marker, repairability=repairability,
+                                                      evidence=result.evidence + " Retried after validated syntax repair in an isolated workspace; source project remains unchanged.")
+                    except (OSError, ValueError, InvalidUnifiedDiffError, PatchApplicabilityError) as exc:
+                        errors.append(f"{finding.finding_id}: dependent verification retry unavailable ({type(exc).__name__})")
         except (InvalidUnifiedDiffError, PatchApplicabilityError) as exc:
             errors.append(f"{finding.finding_id}: repair failed ({type(exc).__name__}): {exc}; no validated repair recorded")
         except Exception as exc:
@@ -522,38 +559,84 @@ def hunt_main(argv: list[str]) -> int:
     if args.as_json:
         print(json.dumps(run.record(), default=str, indent=2))
     else:
-        print("Existing checks (isolated workspace):")
-        print(f"Baseline project checks: {project_status(run.existing_checks)}")
-        for result in run.existing_checks:
-            print(f"[{result.status}] {result.name}")
-            if result.blocked_reason:
-                print(result.blocked_reason)
-        print("\nProactive findings:")
-        if not run.bug_findings:
-            print("No hypotheses returned; this does not establish that the project is bug-free.")
-        for finding in run.bug_findings:
-            print(f"[{finding.verification_state}] {finding.hypothesis.suspected_file}: {finding.hypothesis.suspected_symbol}: {finding.hypothesis.description}")
-            print(finding.evidence)
-        if run.include_quality:
-            print("\nCode Quality Observations:")
-            for finding in run.observations:
-                print(f"[observation] {finding.hypothesis.suspected_file}: {finding.hypothesis.suspected_symbol}: {finding.hypothesis.description}")
-                print(finding.evidence)
-        metric_labels = {"bugs_discovered": "Bugs discovered", "bugs_confirmed": "Bugs confirmed",
-                         "bugs_repairable": "Bugs repairable",
-                         "bugs_blocked_by_unspecified_expected_behavior": "Bugs blocked by unspecified expected behavior",
-                         "bugs_unverifiable": "Bugs unverifiable", "bugs_rejected": "Bugs rejected",
-                         "non_bug_observations": "Non-bug observations"}
-        for name, count in run.bug_metrics.items():
-            print(f"{metric_labels[name]}: {count}")
-        print(f"Hunt mode: {run.mode}. Evidence is bounded; unsupported behavior remains unconfirmed.")
-        if run.artifact_error:
-            print(run.artifact_error)
-        for label, path in (("Hunt findings", run.findings_path), ("Hunt report", run.report_path)):
-            if path:
-                print(f"{label} saved to:\n{path.resolve()}")
-        print(render_repair_output(run))
+        print(render_hunt_summary(run))
     return int(any(not result.passed for result in run.existing_checks) or any(finding.status == "confirmed" for finding in run.bug_findings))
+
+
+def _repair_outcome_counts(run):
+    """Count one terminal repair outcome per confirmed bug for concise CLI use."""
+    repairs = {repair.finding_id: repair for repair in run.repairs}
+    counts = {"verified": 0, "failed": 0, "blocked": 0}
+    for finding in (item for item in run.bug_findings if item.status == "confirmed"):
+        repair = repairs.get(finding.finding_id)
+        if repair is None:
+            errors = any(error.startswith(finding.finding_id + ":") for error in run.repair_errors)
+            counts["failed" if errors else "blocked"] += 1
+            continue
+        validation = repair.validation
+        if validation and validation.passed:
+            counts["verified"] += 1
+        elif validation and ("BLOCKED" in validation.final_status or
+                             (validation.targeted and validation.targeted.blocked_reason)):
+            counts["blocked"] += 1
+        else:
+            counts["failed"] += 1
+    return counts
+
+
+def _short_terminal_hypothesis(value: str, limit: int = 120) -> str:
+    """Collapse a finding to one display line without changing stored text."""
+    compact = " ".join(str(value).split())
+    if len(compact) <= limit:
+        return compact
+    boundary = compact.rfind(" ", 0, limit - 1)
+    if boundary < limit // 2:
+        boundary = limit - 1
+    return compact[:boundary].rstrip(" ,;:") + "…"
+
+
+def render_hunt_summary(run: HuntRun) -> str:
+    """Render only the concise default terminal summary; artifacts retain detail."""
+    if not run.existing_checks:
+        baseline = "NOT AVAILABLE"
+        failed_names = ()
+    elif all(result.passed for result in run.existing_checks):
+        baseline = "PASS"
+        failed_names = ()
+    else:
+        baseline = "FAIL"
+        failed_names = tuple(dict.fromkeys(result.name for result in run.existing_checks if not result.passed))
+    lines = ["AIdebug Hunt", "", "Baseline: " + baseline]
+    if failed_names:
+        lines[-1] += " (" + ", ".join(failed_names) + ")"
+    metrics = run.bug_metrics
+    lines.extend(["", f"Bugs found: {metrics['bugs_discovered']}"])
+    if metrics["bugs_confirmed"] > 0:
+        lines.append(f"Confirmed: {metrics['bugs_confirmed']}")
+    if metrics["bugs_unverifiable"] > 0:
+        lines.append(f"Unverifiable: {metrics['bugs_unverifiable']}")
+
+    repaired = {repair.finding_id for repair in run.repairs if repair.validation and repair.validation.passed}
+    unresolved = [finding for finding in run.bug_findings
+                  if finding.status != "rejected" and
+                  (finding.status != "confirmed" or finding.finding_id not in repaired)]
+    if unresolved:
+        lines.extend(["", "Unresolved:"])
+        for finding in unresolved:
+            symbol = finding.hypothesis.suspected_symbol or "<module>"
+            lines.append(f"- {finding.hypothesis.suspected_file}:{symbol} — "
+                         f"{_short_terminal_hypothesis(finding.hypothesis.description)}")
+
+    outcomes = _repair_outcome_counts(run)
+    repair_lines = [("Repairs verified", outcomes["verified"]),
+                    ("Repairs failed", outcomes["failed"]),
+                    ("Repairs blocked", outcomes["blocked"])]
+    visible_repairs = [(label, count) for label, count in repair_lines if count > 0]
+    if visible_repairs:
+        lines.append("")
+        lines.extend(f"{label}: {count}" for label, count in visible_repairs)
+    lines.extend(["", "Report:", str(run.report_path.resolve()) if run.report_path else "unavailable"])
+    return "\n".join(lines)
 
 
 def render_repair_output(run):

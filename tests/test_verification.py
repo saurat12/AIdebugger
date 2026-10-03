@@ -49,12 +49,23 @@ def test_class_versus_instance_state(tmp_path):
     assert verify(tmp_path, fixed, spec, "Bag").status == "rejected"
 
 
-def test_infinite_loop_has_enforced_subprocess_timeout(tmp_path):
+def test_infinite_loop_stops_at_budget_without_claiming_confirmation(tmp_path):
     finding = verify(tmp_path, "def f():\n    while True:\n        pass\n", {"kind": "timeout", "timeout_ms": 100})
+    assert finding.verification_state == "UNVERIFIABLE", finding.evidence
+    assert "execution limit exceeded: loop/comprehension iteration budget" in finding.evidence
+    assert finding.check is None
+    assert verify(tmp_path, "def f():\n    return 1\n", {"kind": "timeout", "timeout_ms": 100}).status == "rejected"
+
+
+def test_actual_wallclock_timeout_requires_explicit_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr("aidebug.verification.observe", lambda *a: {"timed_out": True, "deadline_ms": 100})
+    finding = verify(tmp_path, "def f():\n    return 1\n", {"kind": "timeout", "timeout_ms": 100})
     assert finding.status == "confirmed", finding.evidence
     assert "after worker readiness" in finding.evidence
     assert "not proof of infinite execution" in finding.evidence
-    assert verify(tmp_path, "def f():\n    return 1\n", {"kind": "timeout", "timeout_ms": 100}).status == "rejected"
+    unclaimed = verify(tmp_path, "def f():\n    return 1\n", {"kind": "equals", "expected": 1})
+    assert unclaimed.verification_state == "UNVERIFIABLE"
+    assert "wall-clock timeout" in unclaimed.evidence
 
 
 def test_resource_leak_uses_virtual_files_not_real_files(tmp_path):

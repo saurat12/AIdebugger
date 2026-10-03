@@ -47,6 +47,10 @@ def test_mutable_default_pattern_does_not_establish_bug(tmp_path):
 def test_concrete_failures_are_counted(tmp_path, source, spec):
     (tmp_path / "app.py").write_text(source)
     finding = HuntVerifier().verify(ProjectInfo(tmp_path, ("python",)), hypothesis(verification_spec=spec))
+    if spec["kind"] == "timeout":
+        assert finding.is_bug and finding.verification_state == "UNVERIFIABLE", finding.evidence
+        assert HuntRun((), (finding,), ()).bug_metrics["bugs_unverifiable"] == 1
+        return
     assert finding.is_bug and finding.status == "confirmed", finding.evidence
     assert HuntRun((), (finding,), ()).bug_metrics["bugs_confirmed"] == 1
 
@@ -97,7 +101,8 @@ def test_cli_reports_and_json_separate_observations(tmp_path, monkeypatch, capsy
     hunt_main([str(tmp_path), *(["--include-quality"] if include_quality else [])])
     output = capsys.readouterr().out
     assert mocked.call_args.kwargs["include_quality"] == include_quality
-    assert ("Code Quality Observations:" in output) == include_quality
-    assert ("Unnecessary verbosity" in output) == include_quality
-    for label in ("Bugs discovered", "Bugs confirmed", "Bugs unverifiable", "Bugs rejected"):
-        assert label + ": 0" in output
+    assert "Code Quality Observations:" not in output
+    assert "Unnecessary verbosity" not in output
+    assert "Bugs found: 0" in output
+    for label in ("Confirmed:", "Unverifiable:", "Repairs verified:", "Repairs failed:", "Repairs blocked:"):
+        assert label not in output

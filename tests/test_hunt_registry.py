@@ -69,6 +69,63 @@ def test_detectors_and_verifiers_can_extend_without_orchestrator_changes(tmp_pat
         detectors.register("custom", lambda *a: None)
 
 
+def test_deterministic_capability_confirms_without_a_structured_plan(tmp_path):
+    (tmp_path / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    hypothesis = item(reproduction={"kind": "custom_evidence"})
+    registry = VerifierRegistry()
+    registry.register("deterministic", lambda h: True,
+                      lambda quick: SimpleNamespace(verify=lambda project, h: Finding(
+                          h, "confirmed", "Independent deterministic evidence",
+                          CheckResult("deterministic", ("bounded-check",), 1, "", "Mismatch", 0))))
+    detector = SimpleNamespace(hunt=lambda project: (hypothesis,))
+    findings = collect_findings(ProjectInfo(tmp_path, ("python",)), (), (detector,),
+                                RegistryVerifier(registry=registry))
+    assert findings[0].status == "confirmed"
+    assert findings[0].verification_plan["source"] == "deterministic_verifier"
+
+
+def test_syntax_location_in_evidence_routes_to_parser_without_llm(tmp_path):
+    (tmp_path / "app.py").write_text("def f(:\n    pass\n", encoding="utf-8")
+    hypothesis = item(suspected_symbol="f", description="Parser rejects this definition",
+                      evidence={"summary": "Syntax error at the declared location", "locations": [
+                          {"file": "app.py", "line": 1}]}, verification_spec=None, verification_plan=None,
+                      reproduction={"approach": "Parse the source", "steps": ["ast.parse"], "expected_behavior": "parses"})
+    detector = SimpleNamespace(hunt=lambda project: (hypothesis,))
+    findings = collect_findings(ProjectInfo(tmp_path, ("python",)), (), (detector,), RegistryVerifier())
+    assert findings[0].status == "confirmed"
+    assert findings[0].verification_plan["source"] == "deterministic_verifier"
+
+
+def test_parse_capability_handles_module_finding_without_spec_or_callable_symbol(tmp_path):
+    (tmp_path / "app.py").write_text("import math\nvalue = )\n", encoding="utf-8")
+    hypothesis = item(suspected_symbol="module import and assignment",
+                      description="The module source has a parse defect",
+                      evidence={"summary": "The assignment is malformed", "source_range": {
+                          "file": "app.py", "start_line": 2, "end_line": 2}},
+                      verification_spec=None, verification_plan=None, reproduction=None)
+    detector = SimpleNamespace(hunt=lambda project: (hypothesis,))
+    syntax, original = collect_findings(ProjectInfo(tmp_path, ("python",)), (), (detector,), RegistryVerifier())
+    assert syntax.status == "confirmed" and syntax.repair_authorized
+    assert syntax.verification_plan["capability"] == "parse_compile"
+    assert "SyntaxError:" in syntax.evidence and "app.py:2:" in syntax.evidence
+    assert original.verification_state == "UNVERIFIABLE"
+
+
+def test_parse_capability_does_not_confirm_unrelated_error(tmp_path):
+    (tmp_path / "app.py").write_text("def f():\n    return 1\n\nvalue = (\n", encoding="utf-8")
+    hypothesis = item(suspected_symbol="not necessarily callable",
+                      evidence={"summary": "The finding concerns the function body", "locations": [
+                          {"file": "app.py", "line": 2}]},
+                      verification_spec=None, verification_plan=None, reproduction=None)
+    detector = SimpleNamespace(hunt=lambda project: (hypothesis,))
+    findings = collect_findings(ProjectInfo(tmp_path, ("python",)), (), (detector,), RegistryVerifier())
+    assert len(findings) == 2
+    assert findings[0].status == "confirmed"
+    assert findings[1].status == "high_confidence"
+    assert "remains separate" in findings[1].evidence
+    assert findings[1].verification_plan["source"] == "deterministic_verifier"
+
+
 def test_claimed_confirmation_without_reproduction_is_withheld(tmp_path):
     registry = VerifierRegistry()
     registry.register("unsafe_claim", lambda h: True, lambda q: SimpleNamespace(verify=lambda p, h: Finding(h, "confirmed", "Trust me")))

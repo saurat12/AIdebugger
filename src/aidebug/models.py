@@ -108,8 +108,6 @@ class ValidationReport:
     confirmation_verifier: str = "restricted-ast-runtime"
     repair_verifier: str = "restricted-ast-runtime"
     plan_reused: bool = False
-    replanned: bool = False
-    replan_reason: str | None = None
 
 
 @dataclass(frozen=True)

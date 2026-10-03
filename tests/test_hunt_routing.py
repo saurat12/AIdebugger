@@ -32,7 +32,7 @@ def test_doctest_hypothesis_does_not_fall_back_to_legacy_scalar_verifier(tmp_pat
     assert "UNVERIFIABLE" in finding.evidence
 
 
-def test_structured_student_input_uses_generic_planner_runtime(tmp_path):
+def test_structured_student_input_uses_generic_runtime(tmp_path):
     (tmp_path / "src").mkdir()
     source = ("def get_passing_students(students, passing_score=60):\n"
               "    passing = {}\n"

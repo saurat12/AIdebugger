@@ -125,8 +125,8 @@ class FakeFixer:
         return PatchProposal(
             f"--- a/{self.source_name}\n+++ b/{self.source_name}\n"
             "@@ -1 +1 @@\n"
-            f"-return {old_value}\n"
-            f"+return {new_value}\n",
+            f"-value = {old_value}\n"
+            f"+value = {new_value}\n",
             "Return the expected value.",
         )
 
@@ -144,7 +144,7 @@ class FakeValidator:
 def test_orchestrator_applies_patch_in_isolated_workspace(tmp_path):
     init_repository(tmp_path)
     source = tmp_path / "app.py"
-    source.write_text("return 1\n", encoding="utf-8")
+    source.write_text("value = 1\n", encoding="utf-8")
     project = ProjectInfo(tmp_path, ("python",), ())
     failure = CheckResult("test", ("test",), 1, "", "failed", 0.01)
     analyzer = FakeAnalyzer()
@@ -156,25 +156,25 @@ def test_orchestrator_applies_patch_in_isolated_workspace(tmp_path):
     assert result.attempts == 1
     assert analyzer.calls == 1
     assert validator.calls == 1
-    assert source.read_text(encoding="utf-8") == "return 1\n"
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
 
 
 def test_isolated_workspace_applies_patch_without_git(tmp_path):
     source = tmp_path / "app.py"
-    source.write_text("return 1\n", encoding="utf-8")
+    source.write_text("value = 1\n", encoding="utf-8")
     patch = (
         "--- a/app.py\n"
         "+++ b/app.py\n"
         "@@ -1 +1 @@\n"
-        "-return 1\n"
-        "+return 2\n"
+        "-value = 1\n"
+        "+value = 2\n"
     )
 
     with isolated_workspace(tmp_path) as workspace:
         apply_unified_diff(workspace, patch)
-        assert (workspace / "app.py").read_text(encoding="utf-8") == "return 2\n"
+        assert (workspace / "app.py").read_text(encoding="utf-8") == "value = 2\n"
 
-    assert source.read_text(encoding="utf-8") == "return 1\n"
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
 
 
 def test_patch_rejects_path_traversal(tmp_path):
@@ -182,12 +182,12 @@ def test_patch_rejects_path_traversal(tmp_path):
         "--- a/app.py\n"
         "+++ b/../../outside.txt\n"
         "@@ -1 +1 @@\n"
-        "-return 1\n"
-        "+return 2\n"
+        "-value = 1\n"
+        "+value = 2\n"
     )
 
     with isolated_workspace(tmp_path) as workspace:
-        (workspace / "app.py").write_text("return 1\n", encoding="utf-8")
+        (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
         try:
             apply_unified_diff(workspace, patch)
         except ValueError as exc:
@@ -201,12 +201,12 @@ def test_patch_rejects_absolute_target_path(tmp_path):
         "--- a/app.py\n"
         f"+++ {tmp_path.drive}\\outside.txt\n"
         "@@ -1 +1 @@\n"
-        "-return 1\n"
-        "+return 2\n"
+        "-value = 1\n"
+        "+value = 2\n"
     )
 
     with isolated_workspace(tmp_path) as workspace:
-        (workspace / "app.py").write_text("return 1\n", encoding="utf-8")
+        (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
         try:
             apply_unified_diff(workspace, patch)
         except ValueError as exc:
@@ -217,7 +217,7 @@ def test_patch_rejects_absolute_target_path(tmp_path):
 
 def test_orchestrator_retries_until_limit(tmp_path):
     init_repository(tmp_path)
-    (tmp_path / "app.py").write_text("return 1\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     project = ProjectInfo(tmp_path, ("python",), ())
     failure = CheckResult("test", ("test",), 1, "", "failed", 0.01)
 
@@ -242,7 +242,7 @@ def test_orchestrator_retries_until_limit(tmp_path):
 
 def test_orchestrator_tracks_all_cumulative_proposals_and_initial_git_evidence(tmp_path):
     source = tmp_path / "app.py"
-    source.write_text("return 1\n", encoding="utf-8")
+    source.write_text("value = 1\n", encoding="utf-8")
     project = ProjectInfo(tmp_path, ("python",), ())
     failure = CheckResult("test", ("test",), 1, "", "failed", 0.01)
 
@@ -278,13 +278,13 @@ def test_orchestrator_tracks_all_cumulative_proposals_and_initial_git_evidence(t
     assert len(result.proposals) == 2
     assert result.proposals[0].unified_diff != result.proposals[1].unified_diff
     assert analyzer.contexts[0].git_diff == "diff --git a/app.py b/app.py"
-    assert source.read_text(encoding="utf-8") == "return 1\n"
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
 
 
 def test_openai_adapter_parses_analysis_and_patch_without_network(tmp_path):
     init_repository(tmp_path)
     source = tmp_path / "app.py"
-    source.write_text("return 1\n", encoding="utf-8")
+    source.write_text("value = 1\n", encoding="utf-8")
     project = ProjectInfo(tmp_path, ("python",), ())
     failure = CheckResult("test", ("test",), 1, "", "failed", 0.01)
     context = build_debug_context(project, failure)
@@ -298,7 +298,7 @@ def test_openai_adapter_parses_analysis_and_patch_without_network(tmp_path):
             if len(self.inputs) == 1:
                 text = '{"root_cause":"wrong return","confidence":0.9,"reasoning":"test expects 2","suspected_files":["app.py"]}'
             else:
-                text = '{"status":"patch","unified_diff":"--- a/app.py\\n+++ b/app.py\\n@@ -1 +1 @@\\n-return 1\\n+return 2\\n","explanation":"Fix return value"}'
+                text = '{"status":"patch","unified_diff":"--- a/app.py\\n+++ b/app.py\\n@@ -1 +1 @@\\n-value = 1\\n+value = 2\\n","explanation":"Fix return value"}'
             return type("Response", (), {"output_text": text})()
 
     responses = FakeResponses()

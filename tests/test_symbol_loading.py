@@ -83,7 +83,7 @@ def run(tmp_path, symbol, spec, source=SOURCE):
     ("get_random_item", {"kind": "deterministic_random", "args": [["only"]], "random_values": {"randint": [1]}, "expected_exception": "IndexError"}, "confirmed", '"type": "IndexError"'),
     ("process_data", {"kind": "mutation_check", "args": [["remove", "remove"]], "expected_args": [[]]}, "confirmed", '"args_after": [["remove"]]'),
     ("compare_values", {"kind": "equals", "args": [[1], [1]], "expected": True}, "confirmed", '"result": false'),
-    ("wait_forever", {"kind": "timeout", "timeout_ms": 100}, "confirmed", "after worker readiness"),
+    ("wait_forever", {"kind": "timeout", "timeout_ms": 100}, "high_confidence", "execution limit exceeded"),
     ("calculate_root", {"kind": "equals", "expected": 1}, "rejected", '"result": 1.0'),
     ("Counter", {"kind": "class_state_check", "constructors": [[], []], "calls": [{"instance": 0, "method": "add", "args": [1]}], "observe": {"instance": 1, "attribute": "items"}, "expected": []}, "confirmed", '"result": [1]'),
 ])
@@ -97,7 +97,7 @@ def test_nested_source_symbol_loaded_without_module_side_effects(tmp_path, symbo
     ("import os\ndef f():\n    return os.environ['API_SECRET']\n", "import is not allowlisted"),
     ("import socket\ndef f():\n    return socket.create_connection(('example.com', 80))\n", "import is not allowlisted"),
     ("import subprocess\ndef f():\n    return subprocess.run(['pip', 'install', 'package'])\n", "import is not allowlisted"),
-    ("import os\nVALUE = os.getenv('API_SECRET')\ndef f():\n    return VALUE\n", "initializer is not a safe constant"),
+    ("import os\nVALUE = os.getenv('API_SECRET')\ndef f():\n    return VALUE\n", "required import is not allowlisted: os"),
     ("VALUE = []\nVALUE.append(1)\ndef f():\n    return VALUE\n", "side-effectful initialization"),
     ("VALUE = OTHER\nOTHER = VALUE\ndef f():\n    return VALUE\n", "cyclic initialization"),
 ])

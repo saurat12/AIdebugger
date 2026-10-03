@@ -155,5 +155,8 @@ def test_hunt_cli_dispatch_and_output(tmp_path, monkeypatch, capsys, json_mode):
     if json_mode:
         assert json.loads(output)["findings"][0]["status"] == "unconfirmed"
     else:
-        assert "Existing checks (isolated workspace):" in output
-        assert "Proactive findings:" in output
+        assert "AIdebug Hunt" in output
+        assert "Baseline: PASS" in output
+        assert "Bugs found: 1" in output
+        assert "Unverifiable: 1" in output
+        assert "- app.py:double — Incorrect doubling" in output

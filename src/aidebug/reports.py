@@ -54,7 +54,6 @@ def validation_sections(report):
         ("Confirmation Verifier", report.confirmation_verifier),
         ("Repair Verification Verifier", report.repair_verifier),
         ("Pinned Plan Reused", str(report.plan_reused).lower()),
-        ("Plan Replanning", ("Yes: " + report.replan_reason) if report.replanned else ("No. " + report.replan_reason if report.replan_reason else "No")),
         ("Checks Used", "\n".join(f"- {r.name}: {' '.join(r.command)}" for r in report.results) or "None"),
         ("Checks Skipped", "\n".join(report.skipped) or "None recorded. Discovery and syntax inspection are bounded; undiscovered checks were not run."),
         ("Blocked Checks", "\n".join(f"- {r.name}: {r.blocked_reason}" for r in (*report.project_results, *((report.syntax,) if report.syntax else ())) if r.blocked_reason) or "None"),

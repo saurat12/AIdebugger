@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from .models import DebugRun
+from .models import DebugRun, ProjectInfo
 from .reports import render_repair_report
 from .workspace import parse_unified_diff, _safe_patch_path
+from .validation import syntax_check
 
 
 def remember_originals(workspace: Path, patch: str, originals: dict[str, bytes | None]) -> None:
@@ -26,6 +27,11 @@ def save_validated_repair(run: DebugRun, workspace: Path, originals: dict[str, b
     """Diff original content against validated content, never concatenate retries."""
     if run.validation is None or not run.validation.passed:
         raise ValueError("Only validated repairs can be saved")
+    if run.validation.syntax is not None and not run.validation.syntax.passed:
+        raise ValueError("Repairs with failed syntax validation cannot be saved")
+    syntax = syntax_check(ProjectInfo(workspace, run.initial_context.project.project_types), originals)
+    if not syntax.passed:
+        raise ValueError("Repair syntax pre-validation failed: " + syntax.stderr)
     chunks: list[str] = []
     changed: list[str] = []
     for name, before in sorted(originals.items()):

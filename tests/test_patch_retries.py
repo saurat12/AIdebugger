@@ -98,6 +98,12 @@ def test_independent_findings_retry_and_report_once(tmp_path, monkeypatch, capsy
     output = capsys.readouterr().out
     assert "Proactive repair: not validated" not in output
     for identifier in ids:
-        assert output.count(f"{identifier}: repair ") == 1
+        assert identifier not in output
+    if correct_retry:
+        assert "Repairs verified: 2" in output
+        assert "Unresolved:" not in output
+    else:
+        assert "Repairs failed: 2" in output
+        assert output.count("- ") >= 2
     assert "test-secret" not in output
     assert all((tmp_path / name).read_text() == source for name in calls)
