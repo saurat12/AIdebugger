@@ -4,7 +4,7 @@ AI Debugger is a CLI that detects your project (Python, Node, or React), runs th
 
 **Your real repository is never modified automatically.** Every proposed fix is applied and validated in a temporary workspace; you review and apply the resulting diff yourself.
 
-**Verification is not "ask the model if it's right."** Fixes and hunted bugs are checked by a restricted AST interpreter running in an isolated `-I -S` Python subprocess with no imports, network, subprocess, or real filesystem access — not `eval`/`exec` on model output. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how that works.
+**Verification is not "ask the model if it's right."** Fixes and hunted bugs are checked by a restricted AST interpreter running in an isolated `-I -S` Python subprocess with no imports, network, subprocess, or real filesystem access — not `eval`/`exec` on model output. See [ARCHITECTURE.md](ARCHITECTURE.md) for how that works.
 
 ## Features
 
@@ -84,7 +84,7 @@ context  unified diff
 - **Validator** applies the diff in an isolated workspace copy and reruns checks
 - **DebugOrchestrator** retries up to a bounded attempt limit and never touches your active repository
 
-Bug hunting follows a parallel path: hypotheses go through independent, sandboxed verification before anything is eligible for repair. Full details — strategy coverage, every numeric bound, the structured verification spec format, extension points, and repair-acceptance rules — are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Bug hunting follows a parallel path: hypotheses go through independent, sandboxed verification before anything is eligible for repair. Full details — strategy coverage, every numeric bound, the structured verification spec format, extension points, and repair-acceptance rules — are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Supported checks
 
