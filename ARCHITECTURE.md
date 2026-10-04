@@ -1,6 +1,6 @@
 # Architecture & Verification Spec
 
-This document is the detailed reference for how AI Debugger discovers projects, hunts for bugs, verifies hypotheses, and accepts repairs. For a quick start, see the top-level [README.md](../README.md).
+This document is the detailed reference for how AI Debugger discovers projects, hunts for bugs, verifies hypotheses, and accepts repairs. For a quick start, see the top-level [README.md](README.md).
 
 ## Contents
 
