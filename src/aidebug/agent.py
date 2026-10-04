@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from dataclasses import replace
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from .context import build_debug_context
 from .artifacts import remember_originals, save_validated_repair
@@ -36,6 +36,15 @@ class Validator(Protocol):
     """Run checks against a patched workspace."""
 
     def validate(self, project: ProjectInfo) -> ValidationReport: ...
+
+
+@runtime_checkable
+class PreparableValidator(Validator, Protocol):
+    """A validator that captures a baseline before repair attempts."""
+
+    baseline: tuple[CheckResult, ...]
+
+    def prepare(self, project: ProjectInfo, failure: CheckResult) -> None: ...
 
 
 class CheckValidator:
@@ -92,8 +101,51 @@ class DebugOrchestrator:
     ) -> DebugRun:
         """Try to repair one failed check without modifying the active repository."""
 
-        context = build_debug_context(project, failure, changed_files=changed_files, git_diff=git_diff)
-        initial_context = context
+        initial_context = build_debug_context(project, failure, changed_files=changed_files, git_diff=git_diff)
+        with isolated_workspace(project.root) as workspace:
+            isolated_project, context = self._prepare_isolated_context(project, initial_context, workspace)
+            blocked_run = self._prepare_validator(isolated_project, failure, initial_context)
+            if blocked_run is not None:
+                return blocked_run
+            return self._attempt_repairs(initial_context, isolated_project, context, workspace, finding_id)
+
+    def _prepare_isolated_context(
+        self, project: ProjectInfo, initial_context: DebugContext, workspace: Path
+    ) -> tuple[ProjectInfo, DebugContext]:
+        isolated_project = ProjectInfo(root=workspace, project_types=project.project_types, checks=project.checks)
+        context = replace(
+            initial_context,
+            project=isolated_project,
+            relevant_files=tuple(workspace / p.relative_to(project.root) for p in initial_context.relevant_files),
+        )
+        return isolated_project, context
+
+    def _prepare_validator(
+        self, project: ProjectInfo, failure: CheckResult, initial_context: DebugContext
+    ) -> DebugRun | None:
+        if not isinstance(self.validator, PreparableValidator):
+            return None
+        self.validator.prepare(project, failure)
+        blocked = next(
+            (r for r in self.validator.baseline if identity(r) == identity(failure) and r.blocked_reason), None
+        )
+        if blocked is None:
+            return None
+        validation = evaluate(project, blocked, self.validator.baseline, self.validator.baseline)
+        return DebugRun(
+            initial_context,
+            AnalysisReport("Validation environment is unavailable", 1.0, blocked.blocked_reason),
+            (), validation, 0,
+        )
+
+    def _attempt_repairs(
+        self,
+        initial_context: DebugContext,
+        isolated_project: ProjectInfo,
+        context: DebugContext,
+        workspace: Path,
+        finding_id: str | None,
+    ) -> DebugRun:
         analysis: AnalysisReport | None = None
         proposal: PatchProposal | None = None
         proposals: list[PatchProposal] = []
@@ -101,70 +153,64 @@ class DebugOrchestrator:
         originals: dict[str, bytes | None] = {}
         patch_errors: list[str] = []
 
-        with isolated_workspace(project.root) as workspace:
-            isolated_project = ProjectInfo(
-                root=workspace,
-                project_types=project.project_types,
-                checks=project.checks,
-            )
-            context = replace(initial_context, project=isolated_project,
-                              relevant_files=tuple(workspace / p.relative_to(project.root)
-                                                   for p in initial_context.relevant_files))
-            if isinstance(self.validator, CheckValidator):
-                self.validator.prepare(isolated_project, failure)
-                blocked = next((r for r in self.validator.baseline if identity(r) == identity(failure) and r.blocked_reason), None)
-                if blocked:
-                    validation = evaluate(isolated_project, blocked, self.validator.baseline, self.validator.baseline)
-                    return DebugRun(initial_context, AnalysisReport("Validation environment is unavailable", 1.0, blocked.blocked_reason),
-                                    (), validation, 0)
-            for attempt in range(1, self.max_attempts + 1):
-                analysis = self.analyzer.analyze(context)
-                proposal = self.fixer.propose(context, analysis)
-                if proposal.status == "no_patch":
-                    proposals.append(proposal)
-                    return DebugRun(initial_context, analysis, tuple(proposals), validation, attempt,
-                                    patch_errors=tuple(patch_errors))
-                assert proposal.unified_diff is not None
-                try:
-                    remember_originals(workspace, proposal.unified_diff, originals)
-                    apply_unified_diff(workspace, proposal.unified_diff)
-                except (InvalidUnifiedDiffError, PatchApplicabilityError) as exc:
-                    patch_errors.append(f"Attempt {attempt}: {type(exc).__name__}: {exc}")
-                    if attempt == self.max_attempts:
-                        raise type(exc)("Retry limit reached. " + " | ".join(patch_errors)) from None
-                    context = replace(context, patch_feedback=tuple(patch_errors))
-                    continue
+        for attempt in range(1, self.max_attempts + 1):
+            analysis = self.analyzer.analyze(context)
+            proposal = self.fixer.propose(context, analysis)
+            if proposal.status == "no_patch":
                 proposals.append(proposal)
-                syntax = syntax_check(isolated_project, originals)
-                if not syntax.passed:
-                    patch_errors.append(f"Attempt {attempt}: repair syntax pre-validation failed: {syntax.stderr}")
-                    pin = getattr(self.validator, "pinned_plan", None) or {}
-                    mechanism = pin.get("verifier", "restricted-ast-runtime")
-                    validation = syntax_rejection(isolated_project, syntax, getattr(self.validator, "baseline", ()),
-                                                  confirmation_verifier=mechanism, repair_verifier=mechanism)
-                else:
-                    validation = self.validator.validate(isolated_project)
-                    if validation.syntax is None:
-                        validation = replace(validation, syntax=syntax)
-                if validation.passed:
-                    run = DebugRun(initial_context, analysis, tuple(proposals), validation, attempt,
-                                   patch_errors=tuple(patch_errors), finding_id=finding_id)
-                    try:
-                        patch_path, report_path = save_validated_repair(run, workspace, originals)
-                    except (OSError, ValueError) as exc:
-                        return replace(run, artifact_error=f"Artifact-save error ({type(exc).__name__}): could not persist the repair patch/report pair. Check the project .aidebug directory and permissions.")
-                    return replace(run, validated_patch_path=patch_path, debug_report_path=report_path)
-                failed = validation.targeted if validation.targeted and not validation.targeted.passed else next(
-                    (result for result in validation.results if not result.passed and not result.blocked_reason
-                     and (not validation.targeted or any(item.startswith(result.name + ":") for item in validation.regressions))), None)
-                if failed is None and validation.syntax and not validation.syntax.passed and not validation.syntax.blocked_reason:
-                    failed = validation.syntax
-                if failed is not None and failed.blocked_reason:
-                    break
-                if failed is None:
-                    break
-                context = replace(build_debug_context(isolated_project, failed), patch_feedback=tuple(patch_errors))
+                return DebugRun(initial_context, analysis, tuple(proposals), validation, attempt,
+                                patch_errors=tuple(patch_errors))
+            assert proposal.unified_diff is not None
+            try:
+                remember_originals(workspace, proposal.unified_diff, originals)
+                apply_unified_diff(workspace, proposal.unified_diff)
+            except (InvalidUnifiedDiffError, PatchApplicabilityError) as exc:
+                patch_errors.append(f"Attempt {attempt}: {type(exc).__name__}: {exc}")
+                if attempt == self.max_attempts:
+                    raise type(exc)("Retry limit reached. " + " | ".join(patch_errors)) from None
+                context = replace(context, patch_feedback=tuple(patch_errors))
+                continue
+            proposals.append(proposal)
+            validation = self._validate_repair(isolated_project, originals, attempt, patch_errors)
+            if validation.passed:
+                run = DebugRun(initial_context, analysis, tuple(proposals), validation, attempt,
+                               patch_errors=tuple(patch_errors), finding_id=finding_id)
+                return self._persist_validated_run(run, workspace, originals)
+            failed = validation.targeted if validation.targeted and not validation.targeted.passed else next(
+                (result for result in validation.results if not result.passed and not result.blocked_reason
+                 and (not validation.targeted or any(item.startswith(result.name + ":") for item in validation.regressions))), None)
+            if failed is None and validation.syntax and not validation.syntax.passed and not validation.syntax.blocked_reason:
+                failed = validation.syntax
+            if failed is not None and failed.blocked_reason:
+                break
+            if failed is None:
+                break
+            context = replace(build_debug_context(isolated_project, failed), patch_feedback=tuple(patch_errors))
 
         assert analysis is not None and proposal is not None and validation is not None
         return DebugRun(initial_context, analysis, tuple(proposals), validation, attempt,
                         patch_errors=tuple(patch_errors), finding_id=finding_id)
+
+    def _validate_repair(
+        self, project: ProjectInfo, originals: dict[str, bytes | None], attempt: int, patch_errors: list[str]
+    ) -> ValidationReport:
+        syntax = syntax_check(project, originals)
+        if not syntax.passed:
+            patch_errors.append(f"Attempt {attempt}: repair syntax pre-validation failed: {syntax.stderr}")
+            pin = getattr(self.validator, "pinned_plan", None) or {}
+            mechanism = pin.get("verifier", "restricted-ast-runtime")
+            return syntax_rejection(project, syntax, getattr(self.validator, "baseline", ()),
+                                    confirmation_verifier=mechanism, repair_verifier=mechanism)
+        validation = self.validator.validate(project)
+        if validation.syntax is None:
+            validation = replace(validation, syntax=syntax)
+        return validation
+
+    def _persist_validated_run(
+        self, run: DebugRun, workspace: Path, originals: dict[str, bytes | None]
+    ) -> DebugRun:
+        try:
+            patch_path, report_path = save_validated_repair(run, workspace, originals)
+        except (OSError, ValueError) as exc:
+            return replace(run, artifact_error=f"Artifact-save error ({type(exc).__name__}): could not persist the repair patch/report pair. Check the project .aidebug directory and permissions.")
+        return replace(run, validated_patch_path=patch_path, debug_report_path=report_path)

@@ -4,7 +4,7 @@ import sys
 from aidebug.context import build_agent_prompt, build_debug_context, select_relevant_files
 from aidebug.code_tools import CodeTools
 from aidebug.discovery import discover_repository
-from aidebug.agent import DebugOrchestrator
+from aidebug.agent import DebugOrchestrator, PreparableValidator
 from aidebug.models import AnalysisReport, CheckResult, PatchProposal, ProjectInfo, ValidationReport
 from aidebug.openai_agent import OpenAIAgent
 from aidebug.runner import run_check
@@ -157,6 +157,40 @@ def test_orchestrator_applies_patch_in_isolated_workspace(tmp_path):
     assert analyzer.calls == 1
     assert validator.calls == 1
     assert source.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_structural_preparable_validator_blocks_unavailable_environment(tmp_path):
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    project = ProjectInfo(tmp_path, ("python",), ())
+    failure = CheckResult("test", ("test",), 1, "", "failed", 0.01)
+
+    class CustomValidator:
+        def __init__(self):
+            self.baseline = ()
+            self.prepared_root = None
+
+        def prepare(self, isolated_project, original_failure):
+            self.prepared_root = isolated_project.root
+            assert original_failure is failure
+            self.baseline = (CheckResult("test", ("test",), 1, "", "", 0, blocked_reason="tool missing"),)
+
+        def validate(self, isolated_project):
+            raise AssertionError("blocked validation must not run")
+
+    validator = CustomValidator()
+    analyzer = FakeAnalyzer()
+    fixer = FakeFixer()
+    assert isinstance(validator, PreparableValidator)
+
+    run = DebugOrchestrator(analyzer, fixer, validator).run(project, failure)
+
+    assert run.attempts == 0
+    assert run.analysis.root_cause == "Validation environment is unavailable"
+    assert run.analysis.reasoning == "tool missing"
+    assert run.proposals == ()
+    assert run.validation.project_status == "BLOCKED"
+    assert analyzer.calls == fixer.calls == 0
+    assert validator.prepared_root != project.root
 
 
 def test_isolated_workspace_applies_patch_without_git(tmp_path):
